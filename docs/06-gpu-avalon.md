@@ -81,6 +81,11 @@ rectangles are clipped to the viewport, and each mesh is limited to 8,192 triang
 Mesh, matrix, texture, colour, depth, index, and attribute ranges are checked before raw buffer
 access. Invalid descriptors or exhausted work set status 3 and stop draining the queue.
 
+Compositing is per band and best-effort: a tiled draw composites each band as soon as that band is
+drawn, so a band the budget cut short reaches the target with the fragments it did write, exactly the
+way a single-tile draw keeps the triangles that finished before the budget ran out. A faulted frame
+is therefore partial by construction - status 3 is what tells the host not to present it.
+
 The colour and depth planes live in RAM, so the rasteriser writes straight into
 the guest's framebuffer with no intermediate copy.
 
