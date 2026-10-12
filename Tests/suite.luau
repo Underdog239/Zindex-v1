@@ -1276,8 +1276,33 @@ end
 
 do
 	-- Tiled drawing on a viewport above 1,000,000 pixels: rejected under the old
-	-- fixed ceiling, accepted once the budget follows the viewport.
+	-- fixed ceiling, accepted once the budget follows the viewport. The mesh is a
+	-- real clip-space triangle with a real matrix - a zeroed descriptor returns
+	-- before rasterising anything, which would leave the draw half of the budget
+	-- untested and let the combined draw-and-copy charge break silently.
+	--
+	-- Identity matrix at 0xA000, one clip-space triangle at 0x9500, descriptor at
+	-- 0x9000 (the layout `scene` uses, scaled up to a 1024x1024 viewport).
+	local function largeScene(chip)
+		local ram = chip:ram()
+		putFloats(ram, 0xA000, {
+			1.0, 0.0, 0.0, 0.0,
+			0.0, 1.0, 0.0, 0.0,
+			0.0, 0.0, 1.0, 0.0,
+			0.0, 0.0, 0.0, 1.0,
+		})
+		putFloats(ram, 0x9500, { -1.0, -1.0, 0.0, 1.0, -1.0, 0.0, -1.0, 1.0, 0.0 })
+		buffer.writeu32(ram, 0x9000, 3)      -- vertexCount
+		buffer.writeu32(ram, 0x9004, 0x9500) -- positions
+		buffer.writeu32(ram, 0x9008, 0)
+		buffer.writeu32(ram, 0x900C, 0)
+		buffer.writeu32(ram, 0x9010, 0)
+		buffer.writeu32(ram, 0x9014, 3)      -- indexCount
+		return ram
+	end
+
 	local chip = Zindex.new({ ramSize = 0x1000000, width = 1024, height = 1024, back = 0x100000, depth = 0x500000 })
+	local ram = largeScene(chip)
 	chip.gpu.tileCount = 4
 	chip.gpu.queueBase = 0x8000
 	chip.gpu.queueCount = 1
@@ -1288,19 +1313,60 @@ do
 
 	local savedWork = Zindex.Raster.MAX_WORK
 	local savedPerPixel = Zindex.Raster.WORK_PER_PIXEL
+	-- The old fixed ceiling: the whole-plane tile copy (1,048,576 units) alone does
+	-- not fit, so the frame is rejected before any band is drawn or composited.
 	Zindex.Raster.MAX_WORK = 1000000
 	Zindex.Raster.WORK_PER_PIXEL = 0
+	chip.gpu:resetStats()
 	chip.gpu.pending = true
 	chip:pumpGpu()
 	eq('tiled draw is work-limited under a fixed ceiling', chip.gpu.status, 3)
 	eq('work-limited tiled draw composites nothing', chip.gpu.raster.stats.tilesComposited, 0)
+	eq('work-limited tiled draw draws nothing', chip.gpu.raster.stats.drawn, 0)
 
+	-- A ceiling that fits the tile copy but not the triangle's candidate pixels:
+	-- the raster half of the charge is real work, so this frame is rejected too.
+	Zindex.Raster.MAX_WORK = 1100000
+	chip.gpu:resetStats()
+	chip.gpu.pending = true
+	chip:pumpGpu()
+	eq('tiled draw over a copy-only budget is rejected', chip.gpu.status, 3)
+	eq('copy-only budget stops before a fragment is written', chip.gpu.raster.stats.drawn, 0)
+
+	-- The real budget: copy plus raster fit, so every band draws and composites.
 	Zindex.Raster.MAX_WORK = savedWork
 	Zindex.Raster.WORK_PER_PIXEL = savedPerPixel
+	chip.gpu:resetStats()
 	chip.gpu.pending = true
 	chip:pumpGpu()
 	eq('tiled draw above 1M pixels is accepted', chip.gpu.status, 2)
+	eq('tiled draw above 1M pixels submits one triangle per band', chip.gpu.raster.stats.triangles, 4)
 	eq('tiled draw above 1M pixels composites every tile', chip.gpu.raster.stats.tilesComposited, 4)
+	check('tiled draw above 1M pixels writes fragments', chip.gpu.raster.stats.drawn > 0, chip.gpu.raster.stats.drawn)
+	-- Screen-space y points down and the projection puts clip -1 at the bottom, so
+	-- this triangle covers {x <= y}: row 64 column 8 is inside it, row 0 column
+	-- 1023 is not.
+	eq('tiled draw fills a pixel inside the triangle', buffer.readu32(ram, 0x100000 + (64 * 1024 + 8) * 4), 0xFFFFFFFF)
+	eq('tiled draw leaves a pixel outside the triangle alone', buffer.readu32(ram, 0x100000 + 1023 * 4), 0)
+
+	-- The same mesh and matrix through the single-tile path: the tile split and the
+	-- bulk composites have to produce the same fragments and the same image.
+	local single = Zindex.new({ ramSize = 0x1000000, width = 1024, height = 1024, back = 0x100000, depth = 0x500000 })
+	local singleRam = largeScene(single)
+	single.gpu.raster:drawMesh(0x9000, 0xA000, 0, 0, false, 0.0001)
+	eq(
+		'tiled draw above 1M pixels draws the same fragment count as single-tile',
+		chip.gpu.raster.stats.drawn,
+		single.gpu.raster.stats.drawn
+	)
+	local identical = true
+	for i = 0, 1024 * 1024 - 1 do
+		if buffer.readu32(ram, 0x100000 + i * 4) ~= buffer.readu32(singleRam, 0x100000 + i * 4) then
+			identical = false
+			break
+		end
+	end
+	check('tiled draw above 1M pixels is pixel-identical to single-tile', identical)
 end
 
 --=====================================================================

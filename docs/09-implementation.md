@@ -32,7 +32,7 @@ python3 Tests/bundle.py && luau --codegen Tests/combined.luau
 
 `Tests/bundle.py` rewrites `require(script.Parent.X)` into a module table so the
 library runs unchanged outside Roblox, then appends `Tests/suite.luau`. The
-suite drives the real core through the real assembler; nothing is mocked. **244
+suite drives the real core through the real assembler; nothing is mocked. **253
 checks, all passing** under both the Luau interpreter and `--codegen` native
 code generation, and every module in `src/Zindex/*.luau` compiles cleanly with
 `luau-compile --codegen`.
@@ -76,8 +76,10 @@ Covered:
   only for the rows it visits and verified to land at the right output offset, while
   the untiled product is still rejected.
 - **Viewport-scaled raster budget**: `clear` and a queued `CLEAR`+`PRESENT` complete on
-  a 1024x768 target, and a tiled draw above 1,000,000 pixels composites every tile,
-  with the fixed-ceiling rejection still pinned by a test that lowers the budget knobs.
+  a 1024x768 target, and a tiled draw above 1,000,000 pixels - a real triangle through a
+  real matrix, not an empty descriptor - draws fragments, composites every band, matches
+  the single-tile fragment count and is byte-identical to single-tile output, while a
+  ceiling that fits the tile copy but not the raster is still rejected.
 - **Save-state fidelity for the viewport**: a scale below the adaptive floor survives
   `snapshot`/`restore` verbatim, and the GPU, raster and framebuffer descriptor all
   report the same size afterwards.
@@ -144,3 +146,23 @@ regression test that fails on the previous code (18 failing checks before the fi
    1,000,000 pixels. The depth clear is now charged per row and the per-pump budget is
    `max(1,000,000, 8 x viewport pixels)`, which stays bounded because the viewport is
    host configuration.
+
+## 6. Findings fixed in the third pass
+
+One review finding against the second pass, plus what strengthening its test exposed
+(4 of the rewritten checks fail on the code that finding was filed against):
+
+1. **The large-viewport tiled test drew nothing.** It pointed `DRAW_MESH` at mesh address
+   `0x9000` but never wrote a descriptor or vertices there, so the rasteriser returned
+   before touching a pixel: the block proved that the whole-plane tile copy was charged,
+   never that the draw was. It now writes an identity matrix, a clip-space triangle and a
+   descriptor, and checks the per-band triangle submissions, the fragments written, a
+   pixel inside the triangle and a pixel outside it - and that the tiled result is
+   byte-identical, fragment for fragment, to the same scene through the single-tile path.
+   It also grew a ceiling that fits the tile copy but not the raster, which is the case
+   that keeps the combined draw-and-copy charge honest.
+2. **A budget-cut band is composited best-effort**, which the rewritten test made
+   observable (the copy-only ceiling composites one band and writes no fragments). The
+   behaviour is deliberate - it is the same granularity a single-tile draw has, where the
+   triangles that finished stay written - so it is now stated in doc 06 instead of being
+   left to be rediscovered. Nothing about it changed in code.
