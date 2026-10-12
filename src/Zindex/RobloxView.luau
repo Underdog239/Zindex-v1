@@ -4,8 +4,9 @@
 	a Roblox API.
 
 	It owns the EditableImage, performs exactly one upload per frame (the hard
-	limit documented in docs/06-gpu-avalon.md section 5), and keeps the core
-	engine-free so the core stays native-compilable and testable off-platform.
+	limit documented in docs/06-gpu-avalon.md section 5), honours Avalon-style
+	adaptive resolution scaling, and keeps the core engine-free so the core stays
+	native-compilable and testable off-platform.
 
 	In a published experience EditableImage fails by default: it needs 13+ age
 	verification and ID verification, plus "Enable Mesh / Image APIs" switched on
@@ -27,6 +28,25 @@ function RobloxView.new(chip, options)
 	local height = opts.height or chip.devices.framebuffer.height
 	local self = setmetatable({}, RobloxView)
 	self.chip = chip
+	self.parent = opts.parent
+	self.adaptive = opts.adaptive ~= false
+	self.width = width
+	self.height = height
+	self.staging = nil
+	self.image = nil
+	self.label = nil
+	self.connection = nil
+	self:_allocate(width, height)
+	return self
+end
+
+function RobloxView:_allocate(width: number, height: number)
+	if self.label ~= nil then
+		self.label:Destroy()
+	end
+	if self.image ~= nil then
+		self.image:Destroy()
+	end
 	self.width = width
 	self.height = height
 	self.staging = buffer.create(width * height * 4)
@@ -36,14 +56,15 @@ function RobloxView.new(chip, options)
 	self.label.Size = UDim2.fromOffset(width, height)
 	self.label.BackgroundTransparency = 1
 	self.label.ImageContent = Content.fromObject(self.image)
-	self.label.Parent = opts.parent
-	self.connection = nil
-	return self
+	self.label.Parent = self.parent
 end
 
 --- Copy the guest's back buffer into the image. Exactly one upload per call.
 function RobloxView:present()
 	local descriptor, ram = self.chip:framebuffer()
+	if descriptor.width > 0 and descriptor.height > 0 and (descriptor.width ~= self.width or descriptor.height ~= self.height) then
+		self:_allocate(descriptor.width, descriptor.height)
+	end
 	local back = descriptor.back
 	local bytes = self.width * self.height * 4
 	if back <= 0 or back + bytes > buffer.len(ram) then
@@ -59,8 +80,11 @@ function RobloxView:start(cyclesPerFrame)
 	if self.connection ~= nil then
 		return
 	end
-	self.connection = RunService.RenderStepped:Connect(function()
+	self.connection = RunService.RenderStepped:Connect(function(dt)
 		self.chip:run(cyclesPerFrame)
+		if self.adaptive and self.chip.gpu ~= nil then
+			self.chip.gpu:adapt(dt)
+		end
 		if self.chip.devices.framebuffer.presentRequested then
 			self:present()
 			self.chip.devices.framebuffer.presentRequested = false

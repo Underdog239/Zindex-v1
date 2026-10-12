@@ -2,11 +2,17 @@
 --[[
 	Assembler - Z32 assembly text to a program image.
 
-	Two passes: the first walks the source to place labels and work out how much
-	space everything needs, the second emits bytes with every symbol resolved.
+	Two passes (after macro expansion): the first walks the source to place
+	labels, resolve `.equ` constants, and work out how much space everything
+	needs; the second emits bytes with every symbol resolved.
 
 	Syntax
 		label:                      define a label
+		.equ COUNT, 16              define a constant symbol
+		.macro push reg             define a macro
+			addi sp, sp, -4
+			sw reg, 0(sp)
+		.endm
 		addi r1, r0, 5              register-immediate ALU
 		add r1, r2, r3              register-register ALU
 		lw r1, 8(r2)                load, base plus displacement
@@ -22,12 +28,12 @@
 		.word 1, 2, 3               data
 		.byte 0xFF, 0x00
 		.half 1000
-		.f32 1.5, 2.25
+		.f32 1.5, 2.25, 1e-3
 		.ascii "hello"
 		.zero 64
 
-	Expressions may use labels and $ (the current address), for example
-	li r1, buffer + 16 or beq r1, r2, skip + 4.
+	Expressions may use labels, `.equ` constants, scientific-notation floats, and
+	$ (the current address), for example `li r1, buffer + 16` or `beq r1, r2, skip + 4`.
 ]]
 
 local Opcodes = require(script.Parent.Opcodes)
@@ -43,9 +49,9 @@ local REGISTER_ALIASES: { [string]: number } = {
 	ra = 31,
 }
 
-local LOADS: { [string]: boolean } = { LB = true, LBU = true, LH = true, LHU = true, LW = true }
-local STORES: { [string]: boolean } = { SB = true, SH = true, SW = true }
-local VEC_FULL: { [string]: boolean } = { VADD = true, VSUB = true, VMUL = true }
+local LOADS: { [string]: boolean } = { LB = true, LBU = true, LH = true, LHU = true, LW = true, LWS = true }
+local STORES: { [string]: boolean } = { SB = true, SH = true, SW = true, SWS = true }
+local VEC_FULL: { [string]: boolean } = { VADD = true, VSUB = true, VMUL = true, VFMA = true, VMIN = true, VMAX = true }
 
 export type Result = {
 	code: buffer,
@@ -102,13 +108,16 @@ end
 local function splitOperands(text: string): { string }
 	local out = {}
 	for piece in text:gmatch('[^,]+') do
-		out[#out + 1] = trim(piece)
+		local cleaned = trim(piece)
+		if cleaned ~= '' then
+			out[#out + 1] = cleaned
+		end
 	end
 	return out
 end
 
 --- Parse "8(r2)" into a displacement and a base register token.
-local function parseMemory(text: string): (string, string)
+local function parseMemory(text: string): (string?, string)
 	local offset, base = text:match('^([^%(]*)%(([^%)]+)%)$')
 	if base ~= nil then
 		return offset, base
@@ -116,7 +125,26 @@ local function parseMemory(text: string): (string, string)
 	return nil, text
 end
 
---- Evaluate a constant expression, which may reference labels and $.
+--- Check whether a `+` or `-` at `position` inside `text` is the exponent sign
+--- of a scientific-notation float literal like `1e-3` or `2.5E+4` (and not a
+--- hex literal like `0x1E-2`).
+local function isScientificExponentSign(text: string, start: number, position: number): boolean
+	if position <= start + 1 then
+		return false
+	end
+	local prev = text:sub(position - 1, position - 1)
+	if prev ~= 'e' and prev ~= 'E' then
+		return false
+	end
+	local prefix = text:sub(start, position - 2)
+	if prefix:sub(1, 2):lower() == '0x' then
+		return false
+	end
+	return prefix:match('^%d*%.?%d+$') ~= nil
+end
+
+--- Evaluate a constant expression, which may reference labels, `.equ` symbols,
+--- scientific notation (`1e-3`), and `$`.
 local function evaluate(expression: string, symbols: { [string]: number }, here: number): number
 	local text = expression:gsub('%s+', '')
 	if text == '' then
@@ -138,7 +166,7 @@ local function evaluate(expression: string, symbols: { [string]: number }, here:
 		local start = position
 		while position <= #text do
 			local current = text:sub(position, position)
-			if current == '+' or current == '-' then
+			if (current == '+' or current == '-') and not isScientificExponentSign(text, start, position) then
 				break
 			end
 			position += 1
@@ -156,6 +184,141 @@ local function evaluate(expression: string, symbols: { [string]: number }, here:
 		end
 	end
 	return total
+end
+
+--=====================================================================
+-- Pass 0: expand `.macro name [params]` ... `.endm`
+--=====================================================================
+
+local function parseMacroParams(paramText: string): { string }
+	local out = {}
+	for token in paramText:gmatch('[%a_][%w_]*') do
+		out[#out + 1] = token
+	end
+	return out
+end
+
+local function expandMacros(source: string): string
+	local macros: { [string]: { params: { string }, body: { string }, localLabels: { [string]: boolean } } } = {}
+	local lines = {}
+	local currentMacro: string? = nil
+	local currentParams: { string } = {}
+	local currentBody: { string } = {}
+	local currentLabels: { [string]: boolean } = {}
+	local invocationId = 0
+
+	for rawLine in source:gmatch('[^\n]+') do
+		local stripped = trim(rawLine:gsub('%-%-.*$', ''):gsub(';.*$', ''))
+		local lower = stripped:lower()
+
+		if currentMacro ~= nil then
+			if lower == '.endm' or lower:match('^%.endm%s') then
+				macros[currentMacro] = {
+					params = currentParams,
+					body = currentBody,
+					localLabels = currentLabels,
+				}
+				currentMacro = nil
+			else
+				local lbl = stripped:match('^([%a_][%w_]*):')
+				if lbl ~= nil then
+					currentLabels[lbl] = true
+				end
+				currentBody[#currentBody + 1] = rawLine
+			end
+		elseif lower:match('^%.macro%s+') then
+			local header = trim(stripped:sub(7))
+			local name, rest = header:match('^([%a_][%w_]*)%s*(.*)$')
+			if name == nil then
+				fail('.macro needs a name')
+			end
+			currentMacro = name:lower()
+			currentParams = parseMacroParams(rest or '')
+			currentBody = {}
+			currentLabels = {}
+		else
+			lines[#lines + 1] = rawLine
+		end
+	end
+
+	if currentMacro ~= nil then
+		fail('unclosed .macro: ' .. currentMacro)
+	end
+
+	if next(macros) == nil then
+		return source
+	end
+
+	local function expandLine(rawLine: string, depth: number): { string }
+		if depth > 16 then
+			fail('macro expansion recursion limit exceeded')
+		end
+		local clean = rawLine:gsub('%-%-.*$', ''):gsub(';.*$', '')
+		local prefixLabels = {}
+		local rest = clean
+		while true do
+			local label = rest:match('^%s*([%a_][%w_]*):')
+			if label == nil then
+				break
+			end
+			prefixLabels[#prefixLabels + 1] = label .. ':'
+			rest = rest:sub((rest:find(':', 1, true) or 0) + 1)
+		end
+		local bodyText = trim(rest)
+		if bodyText == '' or bodyText:sub(1, 1) == '.' then
+			return { rawLine }
+		end
+		local mnemonic, operandText = bodyText:match('^(%S+)%s*(.*)$')
+		if mnemonic == nil then
+			return { rawLine }
+		end
+		local def = macros[mnemonic:lower()]
+		if def == nil then
+			return { rawLine }
+		end
+
+		invocationId += 1
+		local idSuffix = string.format('__m%d', invocationId)
+		local args = splitOperands(operandText or '')
+		if #args == 0 and operandText ~= nil and trim(operandText) ~= '' then
+			for tok in operandText:gmatch('%S+') do
+				args[#args + 1] = tok
+			end
+		end
+		if #args < #def.params then
+			fail(string.format('macro %s expects %d arguments, got %d', mnemonic, #def.params, #args))
+		end
+
+		local replacements: { [string]: string } = {}
+		for i, param in def.params do
+			replacements[param] = args[i]
+		end
+		for lbl in def.localLabels do
+			replacements[lbl] = lbl .. idSuffix
+		end
+
+		local expanded = {}
+		if #prefixLabels > 0 then
+			expanded[#expanded + 1] = table.concat(prefixLabels, ' ')
+		end
+		for _, macroLine in def.body do
+			local substituted = macroLine:gsub('[%a_][%w_]*', function(word: string): string
+				return replacements[word] or word
+			end)
+			for _, sub in expandLine(substituted, depth + 1) do
+				expanded[#expanded + 1] = sub
+			end
+		end
+		return expanded
+	end
+
+	local out = {}
+	for _, rawLine in lines do
+		for _, expanded in expandLine(rawLine, 0) do
+			out[#out + 1] = expanded
+		end
+	end
+	return table.concat(out, '\n')
 end
 
 --=====================================================================
@@ -195,13 +358,19 @@ local function plan(source: string, origin: number)
 			local directive, argument = text:match('^(%S+)%s*(.*)$')
 			directive = directive:lower()
 			if directive == '.org' then
-				local value = tonumber(argument)
-				if value == nil then
-					fail('.org needs a number')
-				end
+				local value = evaluate(argument, symbols, address)
 				address = value
 			elseif directive == '.entry' then
 				entryName = trim(argument)
+			elseif directive == '.equ' or directive == '.const' then
+				local name, expr = argument:match('^([%a_][%w_]*)%s*,%s*(.+)$')
+				if name == nil then
+					name, expr = argument:match('^([%a_][%w_]*)%s+(.+)$')
+				end
+				if name == nil or expr == nil then
+					fail(directive .. ' needs a symbol name and value')
+				end
+				symbols[name] = evaluate(expr, symbols, address)
 			elseif directive == '.word' or directive == '.half' or directive == '.byte' then
 				local width = 1
 				if directive == '.word' then
@@ -224,10 +393,7 @@ local function plan(source: string, origin: number)
 				records[#records + 1] = { kind = 'ascii', value = literal, address = address }
 				address += #literal
 			elseif directive == '.zero' or directive == '.space' then
-				local count = tonumber(argument)
-				if count == nil then
-					fail(directive .. ' needs a count')
-				end
+				local count = evaluate(argument, symbols, address)
 				records[#records + 1] = { kind = 'zero', count = count, address = address }
 				address += count
 			else
@@ -242,7 +408,7 @@ local function plan(source: string, origin: number)
 			end
 			records[#records + 1] = {
 				kind = 'instr',
-				name = name,
+				name = info.name,
 				form = info.form,
 				op = info.op,
 				operands = splitOperands(operandText),
@@ -279,11 +445,17 @@ local function encode(record, symbols, emit8, emitN)
 			emit8(address + 2, parseVector(operands[2]))
 			emit8(address + 3, parseVector(operands[3]))
 			return
-		elseif name == 'VLEN' then
+		elseif name == 'VLEN' or name == 'VRED' then
 			emit8(address, op)
 			emit8(address + 1, parseRegister(operands[1]))
 			emit8(address + 2, parseVector(operands[2]))
 			emit8(address + 3, 0)
+			return
+		elseif name == 'VSCL' then
+			emit8(address, op)
+			emit8(address + 1, parseVector(operands[1]))
+			emit8(address + 2, parseVector(operands[2]))
+			emit8(address + 3, parseRegister(operands[3]))
 			return
 		end
 		local rt = 0
@@ -307,7 +479,7 @@ local function encode(record, symbols, emit8, emitN)
 			emit8(address, op)
 			emit8(address + 1, parseRegister(operands[1]))
 			emit8(address + 2, parseRegister(base))
-			emit8(address + 3, evaluate(displacement, symbols, address) % 256)
+			emit8(address + 3, evaluate(displacement or '0', symbols, address) % 256)
 			return
 		elseif STORES[name] then
 			local displacement, base = parseMemory(operands[2])
@@ -318,7 +490,7 @@ local function encode(record, symbols, emit8, emitN)
 			emit8(address, op)
 			emit8(address + 1, parseRegister(operands[1]))
 			emit8(address + 2, parseRegister(base))
-			emit8(address + 3, evaluate(displacement, symbols, address) % 256)
+			emit8(address + 3, evaluate(displacement or '0', symbols, address) % 256)
 			return
 		elseif name == 'VCST' then
 			emit8(address, op)
@@ -376,7 +548,7 @@ local function encode(record, symbols, emit8, emitN)
 		emit8(address, op)
 		emit8(address + 1, parseVector(operands[1]))
 		emit8(address + 2, parseRegister(base))
-		emit8(address + 3, evaluate(displacement, symbols, address) % 256)
+		emit8(address + 3, evaluate(displacement or '0', symbols, address) % 256)
 		return
 	end
 
@@ -394,7 +566,8 @@ function Assembler.assemble(source: string, options: { origin: number? }?): Resu
 		origin = options.origin
 	end
 
-	local records, symbols, entryName = plan(source, origin)
+	local expanded = expandMacros(source)
+	local records, symbols, entryName = plan(expanded, origin)
 
 	local image: { [number]: number } = {}
 	local highest = origin

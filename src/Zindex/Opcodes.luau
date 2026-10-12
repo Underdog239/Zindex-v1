@@ -57,9 +57,12 @@ local defs = {
 	{ 'LH', 0x32, 'F3' },
 	{ 'LHU', 0x33, 'F3' },
 	{ 'LW', 0x34, 'F3' },
+	{ 'LWS', 0x35, 'F3' },
 	{ 'SB', 0x38, 'F3' },
 	{ 'SH', 0x39, 'F3' },
 	{ 'SW', 0x3A, 'F3' },
+	{ 'SWS', 0x3B, 'F3' },
+	{ 'AMOADD', 0x3C, 'F2' },
 
 	{ 'BEQ', 0x40, 'F5' },
 	{ 'BNE', 0x41, 'F5' },
@@ -86,6 +89,11 @@ local defs = {
 	{ 'VLEN', 0x66, 'F2' },
 	{ 'VNRM', 0x67, 'F6' },
 	{ 'VCST', 0x68, 'F3' },
+	{ 'VFMA', 0x69, 'F6' },
+	{ 'VRED', 0x6A, 'F2' },
+	{ 'VSCL', 0x6B, 'F2' },
+	{ 'VMIN', 0x6C, 'F6' },
+	{ 'VMAX', 0x6D, 'F6' },
 }
 
 local Opcodes = {
@@ -107,6 +115,9 @@ for _, d in defs do
 	Opcodes.info[entry.op] = entry
 	Opcodes.byName[entry.name] = entry
 end
+
+-- Z-NPU alias for 3-lane dot product (docs/07-npu.md).
+Opcodes.byName.VDP3 = Opcodes.byName.VDOT
 
 --- Byte size of an instruction given its opcode.
 function Opcodes.sizeOf(op: number): number

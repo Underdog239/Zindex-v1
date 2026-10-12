@@ -595,6 +595,429 @@ do
 end
 
 --=====================================================================
+-- Tier 0 / Tier 1 / Tier 2 equivalence & basic-block compiler
+--=====================================================================
+
+do
+	local program = [[
+			li r1, 0x7000
+			li r2, 0
+			li r3, 32
+			li r4, 0x12345678
+		loop:
+			shli r5, r2, 2
+			add r6, r1, r5
+			xor r7, r4, r2
+			shli r8, r7, 3
+			shri r9, r7, 2
+			add r10, r8, r9
+			addi r0, r10, 99
+			sw r10, 0(r6)
+			addi r2, r2, 1
+			bltu r2, r3, loop
+			jal ra, checksum
+			halt
+		checksum:
+			li r11, 0
+			li r2, 0
+		sumloop:
+			shli r5, r2, 2
+			add r6, r1, r5
+			lw r7, 0(r6)
+			add r11, r11, r7
+			addi r2, r2, 1
+			bltu r2, r3, sumloop
+			jalr r0, ra, 0
+	]]
+
+	local chips = {}
+	for _, tier in { 0, 1, 2 } do
+		local c = Zindex.new({ ramSize = 0x10000, tier = tier })
+		c:assemble(program)
+		c:run(100000)
+		chips[tier] = c
+	end
+
+	eq('tier 0 and tier 1 checksum match', chips[1]:reg(11), chips[0]:reg(11))
+	eq('tier 0 and tier 2 checksum match', chips[2]:reg(11), chips[0]:reg(11))
+	eq('tier 0 and tier 1 cycles match', chips[1]:cycles(), chips[0]:cycles())
+	eq('tier 0 and tier 2 cycles match', chips[2]:cycles(), chips[0]:cycles())
+	eq('tier 0 and tier 2 steps match', chips[2].core.steps, chips[0].core.steps)
+	eq('tier 2 keeps r0 hardwired to zero', chips[2]:reg(0), 0)
+	check('tier 1 compiled basic blocks', chips[1].core.stats.blocksCompiled >= 3, chips[1].core.stats.blocksCompiled)
+	check('tier 2 compiled basic blocks', chips[2].core.stats.blocksCompiled >= 3, chips[2].core.stats.blocksCompiled)
+	check('tier 2 reused self-looping blocks', chips[2].core.stats.blockRuns >= 60, chips[2].core.stats.blockRuns)
+	eq('tier 0 compiled zero blocks', chips[0].core.stats.blocksCompiled, 0)
+	eq(
+		'tier 0 and tier 2 RAM are byte-identical',
+		buffer.tostring(chips[2]:ram()),
+		buffer.tostring(chips[0]:ram())
+	)
+end
+
+do
+	-- Self-modifying code: a loop in Tier 2 rewrites its own immediate operand
+	-- on the first iteration; the block cache must invalidate and recompile.
+	local smcSource = [[
+			li r1, 0
+			li r2, 0
+			li r3, 2
+			li r4, patchTarget
+			li r5, 10
+		loop:
+		patchTarget:
+			addi r1, r1, 1
+			sb r5, 3(r4)
+			addi r2, r2, 1
+			bltu r2, r3, loop
+			halt
+	]]
+
+	local c0 = Zindex.new({ ramSize = 0x10000, tier = 0 })
+	c0:assemble(smcSource)
+	c0:run(10000)
+
+	local c2 = Zindex.new({ ramSize = 0x10000, tier = 2 })
+	c2:assemble(smcSource)
+	c2:run(10000)
+
+	eq('self-modifying code result in tier 2', c2:reg(1), 11)
+	eq('self-modifying code matches tier 0', c2:reg(1), c0:reg(1))
+	eq('self-modifying code cycle count matches tier 0', c2:cycles(), c0:cycles())
+	check('self-modifying write triggered block invalidation', c2.core.stats.invalidations >= 1, c2.core.stats.invalidations)
+end
+
+--=====================================================================
+-- Z-NPU vector instructions (VFMA, VDP3, VRED, VSCL, VMIN, VMAX)
+--=====================================================================
+
+do
+	local chip = run[[
+			.org 0x8000
+		vecA:
+			.f32 2.0, -3.0, 4.0
+		vecB:
+			.f32 5.0, 2.0, -1.0
+		vecC:
+			.f32 1.0, 10.0, 2.0
+		scalar:
+			.f32 0.5
+			.org 0x1000
+			li r1, vecA
+			li r2, vecB
+			li r3, vecC
+			li r4, scalar
+			vlw v0, 0(r1)
+			vlw v1, 0(r2)
+			vlw v2, 0(r3)
+			vfma v2, v0, v1
+			vred r5, v2
+			vdp3 r6, v0, v1
+			lw r7, 0(r4)
+			vscl v3, v0, r7
+			vmin v4, v0, v1
+			vmax v5, v0, v1
+			vsw v2, 0x40(r1)
+			vsw v3, 0x50(r1)
+			vsw v4, 0x60(r1)
+			vsw v5, 0x70(r1)
+			halt
+	]]
+	local ram = chip:ram()
+	-- vfma: (2*5+1, -3*2+10, 4*-1+2) = (11, 4, -2)
+	eq('vfma lane 0', buffer.readf32(ram, 0x8040), 11.0)
+	eq('vfma lane 1', buffer.readf32(ram, 0x8044), 4.0)
+	eq('vfma lane 2', buffer.readf32(ram, 0x8048), -2.0)
+	-- vred: 11 + 4 + (-2) = 13
+	eq('vred horizontal sum', chip:reg(5), f32bits(13.0))
+	-- vdp3: 2*5 + (-3)*2 + 4*(-1) = 0
+	eq('vdp3 dot product alias', chip:reg(6), f32bits(0.0))
+	-- vscl: (2, -3, 4) * 0.5 = (1, -1.5, 2)
+	eq('vscl lane 0', buffer.readf32(ram, 0x8050), 1.0)
+	eq('vscl lane 1', buffer.readf32(ram, 0x8054), -1.5)
+	eq('vscl lane 2', buffer.readf32(ram, 0x8058), 2.0)
+	-- vmin / vmax of (2, -3, 4) and (5, 2, -1)
+	eq('vmin lane 0', buffer.readf32(ram, 0x8060), 2.0)
+	eq('vmin lane 1', buffer.readf32(ram, 0x8064), -3.0)
+	eq('vmin lane 2', buffer.readf32(ram, 0x8068), -1.0)
+	eq('vmax lane 0', buffer.readf32(ram, 0x8070), 5.0)
+	eq('vmax lane 1', buffer.readf32(ram, 0x8074), 2.0)
+	eq('vmax lane 2', buffer.readf32(ram, 0x8078), 4.0)
+end
+
+--=====================================================================
+-- Z-NPU co-processor command queue (GEMM, DOT, FMA, NORM, INT8, DMA)
+--=====================================================================
+
+do
+	local chip = newChip(0x10000)
+	chip:assemble[[
+			li r1, 0x0F007000
+			li r2, npuQueue
+			sw r2, 0(r1)
+			li r2, 5
+			sw r2, 4(r1)
+			li r2, 1
+			sw r2, 8(r1)
+			halt
+
+			.org 0x5000
+		-- Matrix A (2 x 4)
+		matA:
+			.f32 1.0, 2.0, 3.0, 4.0
+			.f32 -1.0, 0.0, 2.0, -3.0
+		-- Matrix B (4 x 2)
+		matB:
+			.f32 1.0, 0.0
+			.f32 2.0, 1.0
+			.f32 0.0, -1.0
+			.f32 1.0, 2.0
+		-- Bias (2)
+		bias:
+			.f32 0.5, -1.0
+		-- Output C (2 x 2) at 0x5200
+			.org 0x5200
+		matC:
+			.zero 16
+		-- Vectors for DOT_BATCH (2 vectors)
+			.org 0x5300
+		dotsA:
+			.f32 1.0, 0.0, 2.0, 3.0, 4.0, 0.0
+		dotsB:
+			.f32 4.0, 5.0, 6.0, 0.0, 0.0, 1.0
+		dotsOut:
+			.zero 8
+		-- INT8 quantised weights (4 bytes: -10, 0, 5, 20)
+			.org 0x5400
+		qWeights:
+			.byte 246, 0, 5, 20
+			.org 0x5410
+		dequantOut:
+			.zero 16
+		-- DMA destination
+			.org 0x5500
+		dmaDst:
+			.zero 16
+
+			.org 0x5800
+		npuQueue:
+			-- 0: GEMM 2x2 = (2x4)*(4x2) + bias, ReLU enabled (flags=1)
+			-- A[0]*B[:,0]+0.5 = (1+4+0+4)+0.5 = 9.5
+			-- A[0]*B[:,1]-1.0 = (0+2-3+8)-1.0 = 6.0
+			-- A[1]*B[:,0]+0.5 = (-1+0+0-3)+0.5 = -3.5 -> ReLU -> 0.0
+			-- A[1]*B[:,1]-1.0 = (0+0-2-6)-1.0  = -9.0 -> ReLU -> 0.0
+			.word 3, matA, matC, 2, matB, bias, 0, 1, 2, 4, 0, 0
+			-- 1: DOT_BATCH of 2 vector pairs -> (1*4+0*5+2*6=16, 0)
+			.word 1, dotsA, dotsOut, 2, dotsB, 0, 0, 0, 0, 0, 0, 0
+			-- 2: NORM_BATCH of 1 vector (3, 4, 0) at dotsA+12 -> dst at 0x5350
+			.word 4, dotsA + 12, 0x5350, 1, 0, 0, 0, 0, 0, 0, 0, 0
+			-- 3: DEQUANT_INT8 of 4 weights with scale=0.25 (0x3E800000), bias=1.0 (0x3F800000)
+			.word 5, qWeights, dequantOut, 4, 0x3E800000, 0x3F800000, 0, 0, 0, 0, 0, 0
+			-- 4: DMA_COPY 16 bytes from matC (0x5200) to dmaDst (0x5500)
+			.word 6, matC, dmaDst, 16, 0, 0, 0, 0, 0, 0, 0, 0
+	]]
+	chip:run(1000)
+
+	local ram = chip:ram()
+	eq('npu commands run', chip.npu.commandsRun, 5)
+	eq('npu status is done', chip.npu.status, 2)
+	eq('gemm C[0,0]', buffer.readf32(ram, 0x5200), 9.5)
+	eq('gemm C[0,1]', buffer.readf32(ram, 0x5204), 6.0)
+	eq('gemm C[1,0] ReLU clamped', buffer.readf32(ram, 0x5208), 0.0)
+	eq('gemm C[1,1] ReLU clamped', buffer.readf32(ram, 0x520C), 0.0)
+	eq('npu dot batch 0', buffer.readf32(ram, 0x5330), 16.0)
+	eq('npu dot batch 1', buffer.readf32(ram, 0x5334), 0.0)
+	check('npu norm batch x', math.abs(buffer.readf32(ram, 0x5350) - 0.6) < 1e-5)
+	check('npu norm batch y', math.abs(buffer.readf32(ram, 0x5354) - 0.8) < 1e-5)
+	-- dequant: (-10)*0.25 + 1 = -1.5, 0*0.25 + 1 = 1.0, 5*0.25 + 1 = 2.25, 20*0.25 + 1 = 6.0
+	eq('int8 dequant 0', buffer.readf32(ram, 0x5410), -1.5)
+	eq('int8 dequant 1', buffer.readf32(ram, 0x5414), 1.0)
+	eq('int8 dequant 2', buffer.readf32(ram, 0x5418), 2.25)
+	eq('int8 dequant 3', buffer.readf32(ram, 0x541C), 6.0)
+	eq('dma copied gemm output', buffer.readf32(ram, 0x5500), 9.5)
+	eq('dma bytes stat', chip.npu.stats.dmaBytes, 16)
+	-- GEMM(2x2 with K=4 -> ceil(4/3)=2 vec ops per elem -> 8) + DOT(2) + NORM(1) + DEQUANT(ceil(4/3)=2) = 13
+	eq('npu 3-lane vector ops count', chip.npu.stats.vectorOps, 13)
+end
+
+--=====================================================================
+-- Multi-core execution, shared memory (LWS/SWS/AMOADD) and SYNC barrier
+--=====================================================================
+
+do
+	local cluster = Zindex.new({ ramSize = 0x10000, coreCount = 4, sharedWords = 64 })
+	cluster:assemble[[
+			li r1, 0x0F004000
+			lw r2, 0(r1)         ; coreId (0..3)
+			lw r3, 4(r1)         ; coreCount (4)
+			addi r4, r2, 1       ; coreId + 1
+			muli r5, r4, 10      ; (coreId + 1) * 10
+			sws r5, 0(r2)        ; shared[coreId] = (coreId + 1) * 10
+			li r6, 10
+			amoadd r7, r6, r4    ; atomic add (coreId + 1) into shared[10]
+			sync                 ; wait for all 4 cores
+			bne r2, r0, done     ; only core 0 reduces shared[0..3]
+			li r8, 0
+			lws r9, 0(r0)
+			add r8, r8, r9
+			lws r9, 1(r0)
+			add r8, r8, r9
+			lws r9, 2(r0)
+			add r8, r8, r9
+			lws r9, 3(r0)
+			add r8, r8, r9
+			lws r10, 10(r0)
+		done:
+			halt
+	]]
+	cluster:run(10000)
+
+	check('all 4 cores halted', cluster:halted(1) and cluster:halted(2) and cluster:halted(3) and cluster:halted(4))
+	eq('core 0 sees coreId 0', cluster:reg(2, 1), 0)
+	eq('core 3 sees coreId 3', cluster:reg(2, 4), 3)
+	eq('core 0 sees coreCount 4', cluster:reg(3, 1), 4)
+	eq('shared sum after SYNC barrier (10+20+30+40)', cluster:reg(8, 1), 100)
+	eq('atomic add total across 4 cores (1+2+3+4)', cluster:reg(10, 1), 10)
+	eq('SYNC barrier generation advanced', cluster.devices.ipc.barrierGen, 1)
+end
+
+--=====================================================================
+-- Tile-parallel rasterisation and adaptive resolution
+--=====================================================================
+
+do
+	local single = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000, tileCount = 1 })
+	scene(single)
+	single.gpu.raster:clear(0xFF000000)
+	single.gpu.raster:drawMesh(0x6200, 0x6000, 0, 0, false, 0.0001)
+
+	local tiled = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000, tileCount = 4 })
+	scene(tiled)
+	tiled.gpu.raster:clear(0xFF000000)
+	tiled.gpu.raster:drawMeshTiled(4, 0x6200, 0x6000, 0, 0, false, 0.0001)
+
+	eq('tiled rasteriser composited 4 tiles', tiled.gpu.raster.stats.tilesComposited, 4)
+	local match = true
+	for i = 0, 16 * 16 - 1 do
+		if buffer.readu32(single:ram(), 0x4000 + i * 4) ~= buffer.readu32(tiled:ram(), 0x4000 + i * 4) then
+			match = false
+			break
+		end
+	end
+	check('4-tile composite is pixel-identical to single-tile', match)
+
+	-- Adaptive resolution scaling: shrink on slow frame, grow on fast frame
+	local adaptiveChip = Zindex.new({ ramSize = 0x10000, width = 100, height = 80, back = 0x4000, depth = 0x8000, targetFps = 60 })
+	local shrunkScale = adaptiveChip.gpu:adapt(0.050) -- 50 ms > 16.6 ms * 1.25
+	check('adaptive resolution shrinks on slow frame', shrunkScale < 1.0, shrunkScale)
+	eq('framebuffer width scaled down', adaptiveChip.devices.framebuffer.width, 85)
+	eq('framebuffer height scaled down', adaptiveChip.devices.framebuffer.height, 68)
+	local grownScale = adaptiveChip.gpu:adapt(0.002) -- 2 ms < 16.6 ms * 0.7
+	check('adaptive resolution grows on fast frame', grownScale > shrunkScale, grownScale)
+end
+
+--=====================================================================
+-- Timer interrupts & Audio ring buffer
+--=====================================================================
+
+do
+	local irqCount = 0
+	local lastMask = 0
+	local chip = Zindex.new({
+		ramSize = 0x10000,
+		onInterrupt = function(core, mask)
+			irqCount += 1
+			lastMask = mask
+		end,
+	})
+	chip:assemble[[
+			li r1, 0x0F000000    ; DEV page
+			li r2, 1             ; enable bit 0 (TIMER IRQ)
+			sw r2, 4(r1)
+			li r2, handler
+			sw r2, 0x0C(r1)      ; guest interrupt vector
+			li r3, 0x0F001000    ; TIMER page
+			li r4, 100           ; compare at 100 cycles
+			sw r4, 4(r3)
+			li r4, 1             ; control = 1 (enabled)
+			sw r4, 0x0C(r3)
+			li r5, 0
+		spin:
+			addi r5, r5, 1
+			jmp spin
+		handler:
+			li r6, 0xCAFE
+			halt
+	]]
+	chip:run(2000)
+	check('timer interrupt fired callback', irqCount >= 1, irqCount)
+	eq('interrupt mask is timer bit', lastMask, 1)
+	eq('guest interrupt vector ran and halted', chip:reg(6), 0xCAFE)
+	check('timer fired counter incremented', chip.devices.timer.fired >= 1, chip.devices.timer.fired)
+end
+
+do
+	local chip = newChip(0x10000)
+	chip:assemble[[
+			.org 0x7000
+		samples:
+			.f32 0.25, -0.5, 0.75, 1.0
+			.org 0x1000
+			li r1, 0x0F003000    ; AUDIO page
+			li r2, samples
+			sw r2, 0(r1)         ; base
+			li r2, 16
+			sw r2, 4(r1)         ; ring length in samples
+			li r2, 4
+			sw r2, 0x0C(r1)      ; writeCursor = 4
+			lw r3, 0x1C(r1)      ; queued sample count
+			halt
+	]]
+	chip:run(1000)
+	eq('audio queued sample count readable from MMIO', chip:reg(3), 4)
+	local pulled = chip:pullAudio(4)
+	eq('pulled 4 audio samples', #pulled, 4)
+	eq('audio sample 1', pulled[1], 0.25)
+	eq('audio sample 2', pulled[2], -0.5)
+	eq('audio sample 3', pulled[3], 0.75)
+	eq('audio sample 4', pulled[4], 1.0)
+	eq('audio read cursor advanced to 4', chip.devices.audio.readCursor, 4)
+end
+
+--=====================================================================
+-- Assembler conveniences (.equ, .macro/.endm, scientific float literals)
+--=====================================================================
+
+do
+	local chip = run[[
+			.equ BASE_VAL, 20
+			.equ STEP_VAL, BASE_VAL + 5
+
+			.macro add_twice dst, src
+			local_lbl:
+				add dst, dst, src
+				add dst, dst, src
+			.endm
+
+			.org 0x8000
+		floats:
+			.f32 1e-3, -2.5e-2, 1.5e+2
+
+			.org 0x1000
+			li r1, STEP_VAL
+			li r2, 3
+			add_twice r1, r2
+			add_twice r1, r2
+			halt
+	]]
+	-- r1 starts at 25, add_twice adds 6 twice -> 25 + 6 + 6 = 37
+	eq('.equ and .macro expansion', chip:reg(1), 37)
+	check('scientific notation 1e-3', math.abs(buffer.readf32(chip:ram(), 0x8000) - 1e-3) < 1e-7)
+	check('scientific notation -2.5e-2', math.abs(buffer.readf32(chip:ram(), 0x8004) - (-0.025)) < 1e-6)
+	check('scientific notation 1.5e+2', math.abs(buffer.readf32(chip:ram(), 0x8008) - 150.0) < 1e-4)
+end
+
+--=====================================================================
 -- Summary
 --=====================================================================
 

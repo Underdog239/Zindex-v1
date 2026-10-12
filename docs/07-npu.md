@@ -46,3 +46,19 @@ State that plainly rather than implying an INT8 tensor core exists.
 Not general compute. It is sized for: geometry and transforms, normalisation, lighting
 accumulation, soft-body and particle maths, small MLP inference, and audio DSP blocks. It is a
 co-processor, and it is specified as one.
+
+## 6. Command queue interface (`src/Zindex/Npu.luau`)
+
+Implemented on page `0x0F007000`, fed with the same 48-byte command format as the GPU:
+
+| Op | Meaning |
+| --- | --- |
+| `NOP` (0) | nothing |
+| `DOT_BATCH` (1) | batch of `count` 3D dot products (`dst[i] = dot(src[i], matrix[i])`) |
+| `FMA_BATCH` (2) | batch of `count` 3-lane fused multiply-adds (`mode=0` vector*vector+aux, `mode=1` vector*scalar+aux, optional ReLU) |
+| `GEMM` (3) | 3-lane tiled `C[M x N] = A[M x K] * B[K x N] + bias` with optional ReLU (`flags` bit 0) |
+| `NORM_BATCH` (4) | batch normalize `count` float3 vectors |
+| `DEQUANT_INT8` (5) | unpack `count` signed int8 values to float32 via `q * scale + bias` |
+| `DMA_COPY` (6) | bulk `buffer.copy` of `count` bytes from `src` to `dst` |
+| `DMA_FILL` (7) | bulk `buffer.fill` of `count` bytes at `dst` with byte `src` |
+

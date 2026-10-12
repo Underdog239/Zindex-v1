@@ -10,27 +10,12 @@
 		MVP transform -> near-plane clip -> perspective divide -> back-face cull
 		-> edge-function raster with depth test -> attributes divided by 1/w
 
+	Also implements multi-tile rendering into tile-local colour/depth buffers
+	followed by per-scanline `buffer.copy` compositing (docs/06-gpu-avalon.md
+	section 4), and dynamic resolution resizing for adaptive scale control.
+
 	Everything is a buffer, nothing is allocated per triangle, and the module
 	touches no engine API.
-
-	Colour layout matches Avalon exactly: one `buffer.writeu32` per pixel,
-	packRGBA(r, g, b, a) = r + g*256 + b*65536 + a*16777216.  Depth stores 1/w,
-	so a larger value is nearer, and the plane is cleared to 0.
-
-	Mesh descriptor:
-		+0x00  vertexCount
-		+0x04  positions address   (float3 per vertex)
-		+0x08  colours address     (RGBA8 per vertex, or 0)
-		+0x0C  uvs address         (float2 per vertex, or 0)
-		+0x10  indices address     (u32 per index, or 0 for a plain triangle list)
-		+0x14  indexCount
-
-	Texture descriptor:
-		+0x00  width
-		+0x04  height
-		+0x08  pixels address      (RGBA8, row major)
-
-	The matrix is 16 floats, row major, column-vector convention.
 ]]
 
 local Memory = require(script.Parent.Memory)
@@ -61,7 +46,7 @@ function Raster.new(memory: Memory.Class, width: number, height: number, colour:
 	self.scissorW = width
 	self.scissorH = height
 	self.cull = true
-	self.stats = { triangles = 0, drawn = 0, culled = 0, clipped = 0, fragments = 0 }
+	self.stats = { triangles = 0, drawn = 0, culled = 0, clipped = 0, fragments = 0, tilesComposited = 0 }
 
 	-- Scratch, sized for one clipped triangle (a triangle clipped by a single
 	-- plane has at most four vertices). Allocated once, reused forever.
@@ -97,6 +82,15 @@ function Raster.new(memory: Memory.Class, width: number, height: number, colour:
 	return self
 end
 
+function Raster:resize(width: number, height: number)
+	self.width = width
+	self.height = height
+	self.scissorX = 0
+	self.scissorY = 0
+	self.scissorW = width
+	self.scissorH = height
+end
+
 function Raster:setScissor(x: number, y: number, w: number, h: number)
 	self.scissorX = x
 	self.scissorY = y
@@ -106,19 +100,29 @@ end
 
 --- Fill the colour plane with one packed word and clear depth to 0.
 function Raster:clear(word: number)
-	local stride = self.width * 4
+	local colour: buffer = self.colour
+	local depth: buffer = self.depth
+	local width: number = self.width
+	local height: number = self.height
+	local stride: number = width * 4
+	local colourBase: number = self.colourBase
+	local depthBase: number = self.depthBase
+	local scX: number = self.scissorX
+	local scY: number = self.scissorY
+	local scW: number = self.scissorW
+	local scH: number = self.scissorH
 	-- buffer.fill writes a *byte* value, so a packed colour has to be written
 	-- one 32-bit word at a time. Filling with the word would silently write
 	-- only its low byte.
-	for row = 0, self.scissorH - 1 do
-		local offset = self.colourBase + (self.scissorY + row) * stride + self.scissorX * 4
-		for _ = 1, self.scissorW do
-			buffer.writeu32(self.colour, offset, word)
+	for row = 0, scH - 1 do
+		local offset = colourBase + (scY + row) * stride + scX * 4
+		for _ = 1, scW do
+			buffer.writeu32(colour, offset, word)
 			offset += 4
 		end
 	end
-	for row = 0, self.height - 1 do
-		buffer.fill(self.depth, self.depthBase + row * stride, 0, self.width * 4)
+	for row = 0, height - 1 do
+		buffer.fill(depth, depthBase + row * stride, 0, stride)
 	end
 end
 
@@ -128,6 +132,7 @@ function Raster:resetStats()
 	self.stats.culled = 0
 	self.stats.clipped = 0
 	self.stats.fragments = 0
+	self.stats.tilesComposited = 0
 end
 
 --=====================================================================
@@ -155,76 +160,77 @@ local function byteFromScaled(value: number): number
 end
 
 --- Transform one vertex into clip space and store it.
---- Row-major flat 16-number matrix, column-vector convention: the translation
---- lives in elements 3, 7, 11 and the projection row in 12..15. This is the
---- convention docs/06-gpu-avalon.md states, and the one Avalon R1 uses.
-local function transformVertex(m, ax, ay, az, aw, index, x, y, z)
-	ax[index] = m[0] * x + m[1] * y + m[2] * z + m[3]
-	ay[index] = m[4] * x + m[5] * y + m[6] * z + m[7]
-	az[index] = m[8] * x + m[9] * y + m[10] * z + m[11]
-	aw[index] = m[12] * x + m[13] * y + m[14] * z + m[15]
+--- Row-major flat 16-number matrix (1-based array `m[1..16]`), column-vector
+--- convention: the translation lives in elements 4, 8, 12 (0-based 3, 7, 11)
+--- and the projection row in 13..16 (0-based 12..15).
+local function transformVertex(m: { number }, ax: { number }, ay: { number }, az: { number }, aw: { number }, index: number, x: number, y: number, z: number)
+	ax[index] = m[1] * x + m[2] * y + m[3] * z + m[4]
+	ay[index] = m[5] * x + m[6] * y + m[7] * z + m[8]
+	az[index] = m[9] * x + m[10] * y + m[11] * z + m[12]
+	aw[index] = m[13] * x + m[14] * y + m[15] * z + m[16]
 end
 
 --- Draw a mesh. Returns the number of triangles that reached the rasteriser.
 function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: number, textureAddress: number, cull: boolean?, near: number?): number
 	local memory = self.memory
-	local vertexCount = memory:read32(meshAddress + 0x00)
-	local positionAddress = memory:read32(meshAddress + 0x04)
-	local colourAddress = memory:read32(meshAddress + 0x08)
-	local uvAddress = memory:read32(meshAddress + 0x0C)
-	local indexAddress = memory:read32(meshAddress + 0x10)
-	local indexCount = memory:read32(meshAddress + 0x14)
+	local ram: buffer = memory.ram
+	local vertexCount: number = memory:read32(meshAddress + 0x00)
+	local positionAddress: number = memory:read32(meshAddress + 0x04)
+	local colourAddress: number = memory:read32(meshAddress + 0x08)
+	local uvAddress: number = memory:read32(meshAddress + 0x0C)
+	local indexAddress: number = memory:read32(meshAddress + 0x10)
+	local indexCount: number = memory:read32(meshAddress + 0x14)
 	if indexCount == 0 or vertexCount == 0 then
 		return 0
 	end
 
-	local m = self.matrixValues
+	local m: { number } = self.matrixValues
 	for i = 0, 15 do
-		m[i] = memory:readf32(matrixAddress + i * 4)
+		m[i + 1] = buffer.readf32(ram, matrixAddress + i * 4)
 	end
 
-	local nearPlane = near or 0.0001
+	local nearPlane: number = near or 0.0001
 	if cull ~= nil then
 		self.cull = cull
 	end
-	local culling = self.cull
+	local culling: boolean = self.cull
 
-	local texWidth, texHeight, texPixels = 0, 0, 0
+	local texWidth: number, texHeight: number, texPixels: number = 0, 0, 0
 	if shading == Raster.TEXTURED and textureAddress ~= 0 then
 		texWidth = memory:read32(textureAddress + 0x00)
 		texHeight = memory:read32(textureAddress + 0x04)
 		texPixels = memory:read32(textureAddress + 0x08)
 	end
 
-	local width = self.width
-	local height = self.height
-	local stride = width * 4
-	local colour = self.colour
-	local depthBuffer = self.depth
-	local cx, cy, cw = self.cx, self.cy, self.cw
-	local cr, cg, cb, ca = self.cr, self.cg, self.cb, self.ca
-	local cu, cv = self.cu, self.cv
-	local ax, ay, az, aw = self.ax, self.ay, self.az, self.aw
-	local ar, ag, ab, aa = self.ar, self.ag, self.ab, self.aa
-	local au, av = self.au, self.av
+	local width: number = self.width
+	local height: number = self.height
+	local stride: number = width * 4
+	local colour: buffer = self.colour
+	local depthBuffer: buffer = self.depth
+	local cx: { number }, cy: { number }, cw: { number } = self.cx, self.cy, self.cw
+	local cr: { number }, cg: { number }, cb: { number }, ca: { number } = self.cr, self.cg, self.cb, self.ca
+	local cu: { number }, cv: { number } = self.cu, self.cv
+	local ax: { number }, ay: { number }, az: { number }, aw: { number } = self.ax, self.ay, self.az, self.aw
+	local ar: { number }, ag: { number }, ab: { number }, aa: { number } = self.ar, self.ag, self.ab, self.aa
+	local au: { number }, av: { number } = self.au, self.av
 
-	local colourBase = self.colourBase
-	local depthBase = self.depthBase
-	local xMinBound = self.scissorX
-	local yMinBound = self.scissorY
-	local xMaxBound = self.scissorX + self.scissorW - 1
-	local yMaxBound = self.scissorY + self.scissorH - 1
+	local colourBase: number = self.colourBase
+	local depthBase: number = self.depthBase
+	local xMinBound: number = self.scissorX
+	local yMinBound: number = self.scissorY
+	local xMaxBound: number = self.scissorX + self.scissorW - 1
+	local yMaxBound: number = self.scissorY + self.scissorH - 1
 
-	local triangles = math.floor(indexCount / 3)
-	local rasterized, fragments, written = 0, 0, 0
+	local triangles: number = math.floor(indexCount / 3)
+	local rasterized: number, fragments: number, written: number = 0, 0, 0
 	for triangle = 0, triangles - 1 do
 		self.stats.triangles += 1
 
 		-- Gather the three vertices.
 		for corner = 1, 3 do
-			local index
+			local index: number
 			if indexAddress ~= 0 then
-				index = memory:read32(indexAddress + (triangle * 3 + corner - 1) * 4)
+				index = buffer.readu32(ram, indexAddress + (triangle * 3 + corner - 1) * 4)
 			else
 				index = triangle * 3 + corner - 1
 			end
@@ -239,12 +245,12 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 				az,
 				aw,
 				corner,
-				memory:readf32(positionOffset),
-				memory:readf32(positionOffset + 4),
-				memory:readf32(positionOffset + 8)
+				buffer.readf32(ram, positionOffset),
+				buffer.readf32(ram, positionOffset + 4),
+				buffer.readf32(ram, positionOffset + 8)
 			)
 			if colourAddress ~= 0 then
-				local word = memory:read32(colourAddress + index * 4)
+				local word = buffer.readu32(ram, colourAddress + index * 4)
 				ar[corner] = (word % 256) / 255
 				ag[corner] = (math.floor(word / 256) % 256) / 255
 				ab[corner] = (math.floor(word / 65536) % 256) / 255
@@ -253,8 +259,8 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 				ar[corner], ag[corner], ab[corner], aa[corner] = 1, 1, 1, 1
 			end
 			if uvAddress ~= 0 then
-				au[corner] = memory:readf32(uvAddress + index * 8)
-				av[corner] = memory:readf32(uvAddress + index * 8 + 4)
+				au[corner] = buffer.readf32(ram, uvAddress + index * 8)
+				av[corner] = buffer.readf32(ram, uvAddress + index * 8 + 4)
 			else
 				au[corner], av[corner] = 0, 0
 			end
@@ -297,9 +303,9 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 		-- Project the clipped polygon into screen space. Everything an attribute
 		-- needs is pre-multiplied by 1/w, so the rasteriser never divides per
 		-- attribute - one reciprocal per pixel covers all of them.
-		local sxf, syf, siw = self.sxf, self.syf, self.siw
-		local spr, spg, spb, spa = self.spr, self.spg, self.spb, self.spa
-		local spu, spv = self.spu, self.spv
+		local sxf: { number }, syf: { number }, siw: { number } = self.sxf, self.syf, self.siw
+		local spr: { number }, spg: { number }, spb: { number }, spa: { number } = self.spr, self.spg, self.spb, self.spa
+		local spu: { number }, spv: { number } = self.spu, self.spv
 		for i = 1, count do
 			local w = cw[i]
 			local invW = 1 / w
@@ -384,7 +390,7 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 								local v = (e0 * v0p + e1 * v1p + e2 * v2p) * inv
 								local tx = math.floor(u * texWidth) % texWidth
 								local ty = math.floor(v * texHeight) % texHeight
-								local texel = memory:read32(texPixels + (ty * texWidth + tx) * 4)
+								local texel = buffer.readu32(ram, texPixels + (ty * texWidth + tx) * 4)
 								local tr = texel % 256
 								local tg = math.floor(texel / 256) % 256
 								local tb = math.floor(texel / 65536) % 256
@@ -412,6 +418,93 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 	self.stats.fragments += fragments
 	self.stats.drawn += written
 	return rasterized
+end
+
+--- Composite a tile buffer into the target colour and depth planes using one
+--- bulk `buffer.copy` per scanline row (docs/06-gpu-avalon.md section 4).
+function Raster:compositeTile(tileColour: buffer, tileDepth: buffer, tileX: number, tileY: number, tileW: number, tileH: number)
+	local stride: number = self.width * 4
+	local rowBytes: number = tileW * 4
+	local colour: buffer = self.colour
+	local depth: buffer = self.depth
+	local colourBase: number = self.colourBase
+	local depthBase: number = self.depthBase
+
+	for row = 0, tileH - 1 do
+		local dstOff = (tileY + row) * stride + tileX * 4
+		buffer.copy(colour, colourBase + dstOff, tileColour, dstOff, rowBytes)
+		buffer.copy(depth, depthBase + dstOff, tileDepth, dstOff, rowBytes)
+	end
+	self.stats.tilesComposited += 1
+end
+
+--- Render a mesh across `tileCount` horizontal screen tiles into isolated tile
+--- buffers and composite each tile into the target framebuffer via `buffer.copy`
+--- (docs/06-gpu-avalon.md section 4). Produces pixel-identical output to
+--- single-tile rendering while exercising the tile-split + bulk-composite path.
+function Raster:drawMeshTiled(
+	tileCount: number,
+	meshAddress: number,
+	matrixAddress: number,
+	shading: number,
+	textureAddress: number,
+	cull: boolean?,
+	near: number?
+): number
+	if tileCount <= 1 then
+		return self:drawMesh(meshAddress, matrixAddress, shading, textureAddress, cull, near)
+	end
+
+	local width: number = self.width
+	local height: number = self.height
+	local planeBytes: number = width * height * 4
+	local origColour: buffer = self.colour
+	local origDepth: buffer = self.depth
+	local origColourBase: number = self.colourBase
+	local origDepthBase: number = self.depthBase
+	local origScX, origScY, origScW, origScH = self.scissorX, self.scissorY, self.scissorW, self.scissorH
+
+	local tileColour = buffer.create(planeBytes)
+	local tileDepth = buffer.create(planeBytes)
+
+	local totalRasterized = 0
+	local bandHeight = math.ceil(origScH / tileCount)
+
+	for t = 0, tileCount - 1 do
+		local y0 = origScY + t * bandHeight
+		if y0 >= origScY + origScH then
+			break
+		end
+		local h = math.min(bandHeight, (origScY + origScH) - y0)
+		local x0 = origScX
+		local w = origScW
+
+		-- Seed tile buffers from the current framebuffer region so existing
+		-- pixels and depths in the tile are preserved.
+		local stride = width * 4
+		local rowBytes = w * 4
+		for row = 0, h - 1 do
+			local off = (y0 + row) * stride + x0 * 4
+			buffer.copy(tileColour, off, origColour, origColourBase + off, rowBytes)
+			buffer.copy(tileDepth, off, origDepth, origDepthBase + off, rowBytes)
+		end
+
+		self.colour = tileColour
+		self.depth = tileDepth
+		self.colourBase = 0
+		self.depthBase = 0
+		self:setScissor(x0, y0, w, h)
+		totalRasterized += self:drawMesh(meshAddress, matrixAddress, shading, textureAddress, cull, near)
+
+		self.colour = origColour
+		self.depth = origDepth
+		self.colourBase = origColourBase
+		self.depthBase = origDepthBase
+		self:compositeTile(tileColour, tileDepth, x0, y0, w, h)
+	end
+
+	self:setScissor(origScX, origScY, origScW, origScH)
+	return totalRasterized
 end
 
 return Raster

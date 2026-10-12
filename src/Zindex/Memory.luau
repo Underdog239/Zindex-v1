@@ -1,10 +1,16 @@
 --!strict
+--!native
 --[[
 	Memory - the Z32 address space.
 
 	One byte-addressed `buffer` holds RAM. Above it sits a memory-mapped device
 	window, and above that a trap page. Every access records its cycle cost, so
 	the core never re-derives it and the timing contract stays in one place.
+
+	Also tracks the active code range `[codeLow, codeHigh)` so Tier 1 and Tier 2
+	compiled basic blocks are invalidated immediately whenever a write touches
+	assembled instructions (docs/02-memory-and-devices.md, docs/03-execution-model.md),
+	and hosts the word-addressed shared region for multi-core communication.
 
 	Little-endian throughout, matching `buffer`'s own read/write helpers.
 ]]
@@ -21,17 +27,23 @@ export type Device = {
 	write32: ((offset: number, value: number) -> ())?,
 }
 
-export type Class = typeof(setmetatable(
-	{} :: {
-		ram: buffer,
-		ramSize: number,
-		devices: { [number]: Device },
-		lastCost: number,
-		faults: number,
-		onTrap: ((reason: number, address: number) -> ())?,
-	},
-	Memory
-))
+export type State = {
+	ram: buffer,
+	ramSize: number,
+	devices: { [number]: Device },
+	lastCost: number,
+	faults: number,
+	codeLow: number,
+	codeHigh: number,
+	codeGen: number,
+	onCodeWrite: ((address: number, width: number) -> ())?,
+	onTrap: ((reason: number, address: number) -> ())?,
+	sharedBuf: buffer?,
+	sharedTable: { [number]: number }?,
+	sharedWords: number,
+}
+
+export type Class = typeof(setmetatable({} :: State, Memory))
 
 local WRAP = 4294967296
 local PAGE = 4096
@@ -48,21 +60,139 @@ function Memory.new(ramSize: number): Class
 	self.devices = {}
 	self.lastCost = 1
 	self.faults = 0
+	self.codeLow = 0xFFFFFFFF
+	self.codeHigh = 0
+	self.codeGen = 1
+	self.onCodeWrite = nil
+	self.sharedBuf = nil
+	self.sharedTable = nil
+	self.sharedWords = 0
 	return self
 end
 
 --- Attach a device to a 4 KiB page, or to Memory.DEVICE_BASE to own the window.
-function Memory:registerDevice(pageBase: number, device: Device)
+function Memory.registerDevice(self: Class, pageBase: number, device: Device)
 	self.devices[pageBase] = device
 end
 
-function Memory:getRam(): buffer
+function Memory.getRam(self: Class): buffer
 	return self.ram
 end
 
+--- Record that a compiled basic block covers `[startAddress, endAddress)`.
+function Memory.markCodeRange(self: Class, startAddress: number, endAddress: number)
+	if startAddress < self.codeLow then
+		self.codeLow = startAddress
+	end
+	if endAddress > self.codeHigh then
+		self.codeHigh = endAddress
+	end
+end
+
+--- Reset the tracked code range when the block cache is flushed.
+function Memory.resetCodeRange(self: Class)
+	self.codeLow = 0xFFFFFFFF
+	self.codeHigh = 0
+	self.codeGen += 1
+end
+
+--- Notify the core that `[address, address + width)` in RAM was modified.
+function Memory.notifyCodeWrite(self: Class, address: number, width: number)
+	self.codeGen += 1
+	local hook = self.onCodeWrite
+	if hook ~= nil then
+		hook(address, width)
+	end
+end
+
 --- Copy bytes into RAM, e.g. a program image's data section.
-function Memory:copyIn(address: number, source: buffer, sourceOffset: number?, count: number?)
-	buffer.copy(self.ram, address, source, sourceOffset or 0, count)
+function Memory.copyIn(self: Class, address: number, source: buffer, sourceOffset: number?, count: number?)
+	local offset = sourceOffset or 0
+	local len = count or (buffer.len(source) - offset)
+	buffer.copy(self.ram, address, source, offset, count)
+	if address < self.codeHigh and address + len > self.codeLow then
+		self:notifyCodeWrite(address, len)
+	else
+		self.codeGen += 1
+	end
+end
+
+--- Attach a shared word region (either a `buffer` or a Roblox `SharedTable` / table).
+function Memory.setShared(self: Class, storage: any, wordCount: number)
+	self.sharedWords = wordCount
+	if type(storage) == 'buffer' then
+		self.sharedBuf = storage
+		self.sharedTable = nil
+	else
+		self.sharedBuf = nil
+		self.sharedTable = storage
+	end
+end
+
+--- Read a 32-bit word from the shared region (docs/02-memory-and-devices.md section 5).
+function Memory.readShared(self: Class, wordIndex: number): number
+	self.lastCost = 4
+	local idx = wordIndex % WRAP
+	if idx >= self.sharedWords then
+		self.faults += 1
+		return 0
+	end
+	local sbuf = self.sharedBuf
+	if sbuf ~= nil then
+		return buffer.readu32(sbuf, idx * 4)
+	end
+	local stab = self.sharedTable
+	if stab ~= nil then
+		local v = stab[idx]
+		if v ~= nil then
+			return v % WRAP
+		end
+	end
+	return 0
+end
+
+--- Write a 32-bit word to the shared region.
+function Memory.writeShared(self: Class, wordIndex: number, value: number)
+	self.lastCost = 4
+	local idx = wordIndex % WRAP
+	if idx >= self.sharedWords then
+		self.faults += 1
+		return
+	end
+	local word = value % WRAP
+	local sbuf = self.sharedBuf
+	if sbuf ~= nil then
+		buffer.writeu32(sbuf, idx * 4, word)
+		return
+	end
+	local stab = self.sharedTable
+	if stab ~= nil then
+		stab[idx] = word
+	end
+end
+
+--- Atomically add `delta` to a shared word and return its previous value.
+function Memory.atomicAddShared(self: Class, wordIndex: number, delta: number): number
+	self.lastCost = 4
+	local idx = wordIndex % WRAP
+	if idx >= self.sharedWords then
+		self.faults += 1
+		return 0
+	end
+	local sbuf = self.sharedBuf
+	if sbuf ~= nil then
+		local prev = buffer.readu32(sbuf, idx * 4)
+		buffer.writeu32(sbuf, idx * 4, (prev + delta) % WRAP)
+		return prev
+	end
+	local stab = self.sharedTable
+	if stab ~= nil then
+		local raw = stab[idx]
+		local prev = if raw ~= nil then raw % WRAP else 0
+		stab[idx] = (prev + delta) % WRAP
+		return prev
+	end
+	return 0
 end
 
 local function resolve(self: Class, address: number): (Device?, number)
@@ -82,7 +212,7 @@ local function isDevice(address: number): boolean
 	return address >= Memory.DEVICE_BASE and address < Memory.DEVICE_END
 end
 
-function Memory:read8(address: number): number
+function Memory.read8(self: Class, address: number): number
 	address = address % WRAP
 	if address < self.ramSize then
 		self.lastCost = 1
@@ -103,7 +233,7 @@ function Memory:read8(address: number): number
 	return 0
 end
 
-function Memory:read16(address: number): number
+function Memory.read16(self: Class, address: number): number
 	address = address % WRAP
 	if address < self.ramSize then
 		self.lastCost = 1
@@ -124,7 +254,7 @@ function Memory:read16(address: number): number
 	return 0
 end
 
-function Memory:read32(address: number): number
+function Memory.read32(self: Class, address: number): number
 	address = address % WRAP
 	if address < self.ramSize then
 		self.lastCost = 1
@@ -145,11 +275,14 @@ function Memory:read32(address: number): number
 	return 0
 end
 
-function Memory:write8(address: number, value: number)
+function Memory.write8(self: Class, address: number, value: number)
 	address = address % WRAP
 	if address < self.ramSize then
 		self.lastCost = 1
-		buffer.writeu8(self.ram, address, value % 256)
+		buffer.writeu8(self.ram, address, value)
+		if address < self.codeHigh and address + 1 > self.codeLow then
+			self:notifyCodeWrite(address, 1)
+		end
 		return
 	end
 	if isDevice(address) then
@@ -164,11 +297,14 @@ function Memory:write8(address: number, value: number)
 	self.faults += 1
 end
 
-function Memory:write16(address: number, value: number)
+function Memory.write16(self: Class, address: number, value: number)
 	address = address % WRAP
 	if address < self.ramSize then
 		self.lastCost = 1
-		buffer.writeu16(self.ram, address, value % 65536)
+		buffer.writeu16(self.ram, address, value)
+		if address < self.codeHigh and address + 2 > self.codeLow then
+			self:notifyCodeWrite(address, 2)
+		end
 		return
 	end
 	if isDevice(address) then
@@ -183,11 +319,14 @@ function Memory:write16(address: number, value: number)
 	self.faults += 1
 end
 
-function Memory:write32(address: number, value: number)
+function Memory.write32(self: Class, address: number, value: number)
 	address = address % WRAP
 	if address < self.ramSize then
 		self.lastCost = 1
-		buffer.writeu32(self.ram, address, value % WRAP)
+		buffer.writeu32(self.ram, address, value)
+		if address < self.codeHigh and address + 4 > self.codeLow then
+			self:notifyCodeWrite(address, 4)
+		end
 		return
 	end
 	if isDevice(address) then
@@ -202,7 +341,7 @@ function Memory:write32(address: number, value: number)
 	self.faults += 1
 end
 
-function Memory:readf32(address: number): number
+function Memory.readf32(self: Class, address: number): number
 	address = address % WRAP
 	if address < self.ramSize then
 		self.lastCost = 1
@@ -215,11 +354,14 @@ function Memory:readf32(address: number): number
 	return 0
 end
 
-function Memory:writef32(address: number, value: number)
+function Memory.writef32(self: Class, address: number, value: number)
 	address = address % WRAP
 	if address < self.ramSize then
 		self.lastCost = 1
 		buffer.writef32(self.ram, address, value)
+		if address < self.codeHigh and address + 4 > self.codeLow then
+			self:notifyCodeWrite(address, 4)
+		end
 		return
 	end
 	self.lastCost = 4

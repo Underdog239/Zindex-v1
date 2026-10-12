@@ -1,5 +1,4 @@
 --!strict
---!nonstrict
 --[[
 	Devices - the Z32 device window (docs/02-memory-and-devices.md).
 
@@ -7,11 +6,11 @@
 	an ordinary LW, so there is no second decode path in the core.
 
 	Pages:
-		0x0F000000  DEV    interrupt mask, exit code
-		0x0F001000  TIMER  cycle counter, compare, reload, control
-		0x0F002000  INPUT  buttons, pointer
-		0x0F003000  AUDIO  ring buffer descriptor
-		0x0F004000  IPC    core id, core count, shared region
+		0x0F000000  DEV    interrupt pending/enable mask, exit code, IRQ vector
+		0x0F001000  TIMER  cycle counter, compare, reload, control, fired
+		0x0F002000  INPUT  buttons, pointer, wheel
+		0x0F003000  AUDIO  ring buffer descriptor (base, length, cursors, rate)
+		0x0F004000  IPC    core id, core count, shared region, MMIO atomics
 		0x0F005000  FB     framebuffer descriptor
 ]]
 
@@ -30,8 +29,12 @@ Devices.PAGE = {
 	FB = 0x0F005000,
 }
 
+Devices.IRQ = {
+	TIMER = 1,
+}
+
 --- Build a device from a read function and an optional write function.
-local function registers(read: (number) -> number, write: ((number, number) -> ())?)
+local function registers(read: (number) -> number, write: ((number, number) -> ())?): Memory.Device
 	local device: Memory.Device = {
 		read32 = function(offset: number): number
 			return read(offset) % WRAP
@@ -44,6 +47,14 @@ local function registers(read: (number) -> number, write: ((number, number) -> (
 	end
 	return device
 end
+
+export type Dev = {
+	pending: number,
+	enable: number,
+	exitCode: number,
+	vector: number,
+	returnPc: number,
+}
 
 export type Framebuffer = {
 	width: number,
@@ -73,18 +84,34 @@ export type Input = {
 	wheel: number,
 }
 
+export type Audio = {
+	base: number,
+	length: number,
+	readCursor: number,
+	writeCursor: number,
+	sampleRate: number,
+	channels: number,
+	control: number,
+}
+
 export type Ipc = {
 	coreId: number,
 	coreCount: number,
 	sharedBase: number,
 	sharedSize: number,
+	wordIndex: number,
+	lastAtomic: number,
+	barrierGen: number,
 }
 
 export type Handles = {
+	dev: Dev,
 	timer: Timer,
 	framebuffer: Framebuffer,
 	input: Input,
+	audio: Audio,
 	ipc: Ipc,
+	tick: (cycles: number?) -> number,
 }
 
 --- Attach the standard device set to a memory bus.
@@ -97,7 +124,16 @@ function Devices.attach(memory: Memory.Class, options: {
 	front: number?,
 	coreId: number?,
 	coreCount: number?,
+	sharedSize: number?,
+	onIrqConfig: ((enabled: boolean, vector: number) -> ())?,
 }): Handles
+	local dev: Dev = {
+		pending = 0,
+		enable = 0,
+		exitCode = 0,
+		vector = 0,
+		returnPc = 0,
+	}
 	local timer: Timer = {
 		clock = options.clock,
 		compare = 0,
@@ -118,32 +154,77 @@ function Devices.attach(memory: Memory.Class, options: {
 		presentRequested = false,
 	}
 	local input: Input = { buttons = 0, pointerX = 0, pointerY = 0, wheel = 0 }
+	local audio: Audio = {
+		base = 0,
+		length = 0,
+		readCursor = 0,
+		writeCursor = 0,
+		sampleRate = 44100,
+		channels = 1,
+		control = 0,
+	}
 	local ipc: Ipc = {
 		coreId = options.coreId or 0,
 		coreCount = options.coreCount or 1,
 		sharedBase = 0,
-		sharedSize = 0,
+		sharedSize = options.sharedSize or 0,
+		wordIndex = 0,
+		lastAtomic = 0,
+		barrierGen = 0,
 	}
-	local pending = 0
-	local enable = 0
-	local exitCode = 0
+
+	local function tick(nowCycles: number?): number
+		if bit32.band(timer.control, 1) ~= 0 and timer.compare > 0 then
+			local now = if nowCycles ~= nil then nowCycles else timer.clock()
+			if now >= timer.compare then
+				timer.fired += 1
+				dev.pending = bit32.bor(dev.pending, Devices.IRQ.TIMER)
+				if timer.reload > 0 then
+					local step = timer.reload
+					while timer.compare <= now do
+						timer.compare += step
+					end
+				else
+					timer.control = bit32.band(timer.control, bit32.bnot(1))
+				end
+			end
+		end
+		return bit32.band(dev.pending, dev.enable)
+	end
+
+	local function syncIrqConfig()
+		if options.onIrqConfig ~= nil then
+			local active = dev.enable ~= 0 or bit32.band(timer.control, 1) ~= 0
+			options.onIrqConfig(active, dev.vector)
+		end
+	end
 
 	memory:registerDevice(Devices.PAGE.DEV, registers(function(offset: number): number
 		if offset == 0x00 then
-			return bit32.band(pending, enable)
+			return tick(nil)
 		elseif offset == 0x04 then
-			return enable
+			return dev.enable
 		elseif offset == 0x08 then
-			return exitCode
+			return dev.exitCode
+		elseif offset == 0x0C then
+			return dev.vector
+		elseif offset == 0x10 then
+			return dev.returnPc
 		end
 		return 0
 	end, function(offset: number, value: number)
 		if offset == 0x00 then
-			pending = value
+			dev.pending = value
 		elseif offset == 0x04 then
-			enable = value
+			dev.enable = value
+			syncIrqConfig()
 		elseif offset == 0x08 then
-			exitCode = value
+			dev.exitCode = value
+		elseif offset == 0x0C then
+			dev.vector = value
+			syncIrqConfig()
+		elseif offset == 0x10 then
+			dev.returnPc = value
 		end
 	end))
 
@@ -157,6 +238,7 @@ function Devices.attach(memory: Memory.Class, options: {
 		elseif offset == 0x0C then
 			return timer.control
 		elseif offset == 0x10 then
+			tick(nil)
 			return timer.fired
 		end
 		return 0
@@ -167,8 +249,12 @@ function Devices.attach(memory: Memory.Class, options: {
 			timer.reload = value
 		elseif offset == 0x0C then
 			timer.control = value
+			syncIrqConfig()
 		elseif offset == 0x10 then
 			timer.fired = 0
+			if value == 0 then
+				dev.pending = bit32.band(dev.pending, bit32.bnot(Devices.IRQ.TIMER))
+			end
 		end
 	end))
 
@@ -186,10 +272,43 @@ function Devices.attach(memory: Memory.Class, options: {
 	end, nil))
 
 	memory:registerDevice(Devices.PAGE.AUDIO, registers(function(offset: number): number
+		if offset == 0x00 then
+			return audio.base
+		elseif offset == 0x04 then
+			return audio.length
+		elseif offset == 0x08 then
+			return audio.readCursor
+		elseif offset == 0x0C then
+			return audio.writeCursor
+		elseif offset == 0x10 then
+			return audio.sampleRate
+		elseif offset == 0x14 then
+			return audio.channels
+		elseif offset == 0x18 then
+			return audio.control
+		elseif offset == 0x1C then
+			if audio.length > 0 then
+				return (audio.writeCursor - audio.readCursor) % audio.length
+			end
+			return 0
+		end
 		return 0
 	end, function(offset: number, value: number)
-		-- The audio ring descriptor is a host concern; the guest only points at
-		-- it. Kept addressable so guests can be written against it today.
+		if offset == 0x00 then
+			audio.base = value
+		elseif offset == 0x04 then
+			audio.length = value
+		elseif offset == 0x08 then
+			audio.readCursor = if audio.length > 0 then value % audio.length else value
+		elseif offset == 0x0C then
+			audio.writeCursor = if audio.length > 0 then value % audio.length else value
+		elseif offset == 0x10 then
+			audio.sampleRate = value
+		elseif offset == 0x14 then
+			audio.channels = value
+		elseif offset == 0x18 then
+			audio.control = value
+		end
 	end))
 
 	memory:registerDevice(Devices.PAGE.IPC, registers(function(offset: number): number
@@ -201,6 +320,14 @@ function Devices.attach(memory: Memory.Class, options: {
 			return ipc.sharedBase
 		elseif offset == 0x0C then
 			return ipc.sharedSize
+		elseif offset == 0x10 then
+			return ipc.wordIndex
+		elseif offset == 0x14 then
+			return memory:readShared(ipc.wordIndex)
+		elseif offset == 0x18 then
+			return ipc.lastAtomic
+		elseif offset == 0x1C then
+			return ipc.barrierGen
 		end
 		return 0
 	end, function(offset: number, value: number)
@@ -208,6 +335,12 @@ function Devices.attach(memory: Memory.Class, options: {
 			ipc.sharedBase = value
 		elseif offset == 0x0C then
 			ipc.sharedSize = value
+		elseif offset == 0x10 then
+			ipc.wordIndex = value
+		elseif offset == 0x14 then
+			memory:writeShared(ipc.wordIndex, value)
+		elseif offset == 0x18 then
+			ipc.lastAtomic = memory:atomicAddShared(ipc.wordIndex, value)
 		end
 	end))
 
@@ -231,7 +364,7 @@ function Devices.attach(memory: Memory.Class, options: {
 		elseif offset == 0x20 then
 			return framebuffer.dirtyH
 		elseif offset == 0x24 then
-			return framebuffer.presentRequested and 1 or 0
+			return if framebuffer.presentRequested then 1 else 0
 		end
 		return 0
 	end, function(offset: number, value: number)
@@ -249,10 +382,13 @@ function Devices.attach(memory: Memory.Class, options: {
 	end))
 
 	return {
+		dev = dev,
 		timer = timer,
 		framebuffer = framebuffer,
 		input = input,
+		audio = audio,
 		ipc = ipc,
+		tick = tick,
 	}
 end
 

@@ -86,9 +86,12 @@ Word (LW/SW) addresses must be 4-byte aligned. Byte and half accesses may be una
 | 0x32 | LH | F3 | rd = sign-extended half at [rs+imm8] |
 | 0x33 | LHU | F3 | rd = zero-extended half at [rs+imm8] |
 | 0x34 | LW | F3 | rd = word at [rs+imm8] |
+| 0x35 | LWS | F3 | rd = shared word at index (rs + imm8) |
 | 0x38 | SB | F3 | byte at [rs+imm8] = rt |
 | 0x39 | SH | F3 | half at [rs+imm8] = rt |
 | 0x3A | SW | F3 | word at [rs+imm8] = rt |
+| 0x3B | SWS | F3 | shared word at index (rs + imm8) = rt |
+| 0x3C | AMOADD | F2 | rd = shared[rs]; shared[rs] = (rd + rt) mod 2^32 |
 | 0x40 | BEQ | F5 | branch if rs == rt |
 | 0x41 | BNE | F5 | branch if rs ~= rt |
 | 0x42 | BLT | F5 | branch if rs < rt (signed) |
@@ -108,10 +111,15 @@ Word (LW/SW) addresses must be 4-byte aligned. Byte and half accesses may be una
 | 0x62 | VADD | F6 | vd = vs + vt |
 | 0x63 | VSUB | F6 | vd = vs - vt |
 | 0x64 | VMUL | F6 | vd = vs * vt |
-| 0x65 | VDOT | F2 | rd = dot(vs, vt) as float bits |
+| 0x65 | VDOT / VDP3 | F2 | rd = dot(vs, vt) as float bits |
 | 0x66 | VLEN | F2 | rd = length(vs) as float bits |
 | 0x67 | VNRM | F6 | vd = normalize(vs) |
 | 0x68 | VCST | F3 | vd = constant imm8 (0 = zero, 1 = one) |
+| 0x69 | VFMA | F6 | vd = vs * vt + vd |
+| 0x6A | VRED | F2 | rd = vs.x + vs.y + vs.z as float bits |
+| 0x6B | VSCL | F2 | vd = vs * f32(rt) |
+| 0x6C | VMIN | F6 | vd = min(vs, vt) component-wise |
+| 0x6D | VMAX | F6 | vd = max(vs, vt) component-wise |
 
 ## 5. Semantics
 

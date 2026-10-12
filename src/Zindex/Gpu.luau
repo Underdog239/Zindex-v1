@@ -5,6 +5,9 @@
 	The CPU never calls the GPU. It writes commands into RAM and kicks the queue
 	by writing one MMIO register. The host drains the queue once per CPU budget.
 
+	Also includes Avalon R1's adaptive resolution controller (`setResolutionScale`,
+	`adapt`) and multi-tile rasterisation (`tileCount`).
+
 	Registers, at Gpu.PAGE:
 		+0x00  queue base address
 		+0x04  queue length in commands
@@ -20,14 +23,8 @@
 		+0x2C  scissor y
 		+0x30  scissor width
 		+0x34  scissor height
-
-	A command is 48 bytes, 12 words:
-		+0x00 op      +0x04 src     +0x08 dst     +0x0C count
-		+0x10 matrix  +0x14 texture +0x18 shading +0x1C flags
-		+0x20 rectX   +0x24 rectY   +0x28 rectW   +0x2C rectH
-
-	The colour and depth planes live in RAM, so the rasteriser writes straight
-	into the guest's framebuffer with no intermediate copy.
+		+0x38  tile count (1 = single-tile, >1 = tiled raster + bulk composite)
+		+0x3C  resolution scale, as float bits
 ]]
 
 local Raster = require(script.Parent.Raster)
@@ -60,12 +57,23 @@ local F_Y = 0x24
 local F_W = 0x28
 local F_H = 0x2C
 
+local function round(n: number): number
+	return math.floor(n + 0.5)
+end
+
 function Gpu.attach(memory, options)
 	local self = setmetatable({}, Gpu)
 	self.memory = memory
 	self.framebuffer = options.framebuffer
-	self.width = options.width
-	self.height = options.height
+	self.baseWidth = options.width
+	self.baseHeight = options.height
+	self.scale = options.resolutionScale or 1.0
+	self.minScale = options.minScale or 0.35
+	self.maxScale = options.maxScale or 1.0
+	self.adaptive = options.adaptive ~= false
+	self.targetFps = options.targetFps or 60
+	self.width = math.max(4, round(self.baseWidth * self.scale))
+	self.height = math.max(4, round(self.baseHeight * self.scale))
 	self.ram = memory:getRam()
 	self.colourAddress = options.colour or 0
 	self.depthAddress = options.depth or 0
@@ -77,11 +85,17 @@ function Gpu.attach(memory, options)
 	self.status = 0
 	self.near = 0.0001
 	self.commandsRun = 0
+	self.tileCount = options.tileCount or 1
 	self.scissorX = 0
 	self.scissorY = 0
 	self.scissorW = self.width
 	self.scissorH = self.height
 	self.scratch = buffer.create(4)
+
+	if self.framebuffer ~= nil then
+		self.framebuffer.width = self.width
+		self.framebuffer.height = self.height
+	end
 
 	memory:registerDevice(Gpu.PAGE, {
 		read32 = function(offset: number): number
@@ -94,14 +108,61 @@ function Gpu.attach(memory, options)
 	return self
 end
 
-function Gpu:nearBits(): number
-	buffer.writef32(self.scratch, 0, self.near)
+function Gpu:floatBits(val: number): number
+	buffer.writef32(self.scratch, 0, val)
 	return buffer.readu32(self.scratch, 0)
 end
 
-function Gpu:setNearBits(bits: number)
+function Gpu:bitsFloat(bits: number): number
 	buffer.writeu32(self.scratch, 0, bits)
-	self.near = buffer.readf32(self.scratch, 0)
+	return buffer.readf32(self.scratch, 0)
+end
+
+function Gpu:nearBits(): number
+	return self:floatBits(self.near)
+end
+
+function Gpu:setNearBits(bits: number)
+	self.near = self:bitsFloat(bits)
+end
+
+function Gpu:setTileCount(tiles: number)
+	self.tileCount = math.max(1, math.floor(tiles))
+end
+
+--- Change the internal rendering resolution scale (Avalon R1 adaptive scale).
+function Gpu:setResolutionScale(scale: number): (number, number)
+	local clamped = math.clamp(scale, self.minScale, self.maxScale)
+	self.scale = clamped
+	local w = math.max(4, round(self.baseWidth * clamped))
+	local h = math.max(4, round(self.baseHeight * clamped))
+	self.width = w
+	self.height = h
+	self.scissorX = 0
+	self.scissorY = 0
+	self.scissorW = w
+	self.scissorH = h
+	self.raster:resize(w, h)
+	if self.framebuffer ~= nil then
+		self.framebuffer.width = w
+		self.framebuffer.height = h
+	end
+	return w, h
+end
+
+--- Adapt resolution scale from a measured frame time in seconds:
+--- shrink by 0.85x when >125% of frame budget, grow by 1.08x when <70%.
+function Gpu:adapt(frameSeconds: number): number
+	if not self.adaptive then
+		return self.scale
+	end
+	local budget = 1 / self.targetFps
+	if frameSeconds > budget * 1.25 and self.scale > self.minScale then
+		self:setResolutionScale(self.scale * 0.85)
+	elseif frameSeconds < budget * 0.7 and self.scale < self.maxScale then
+		self:setResolutionScale(self.scale * 1.08)
+	end
+	return self.scale
 end
 
 function Gpu:readRegister(offset: number): number
@@ -133,6 +194,10 @@ function Gpu:readRegister(offset: number): number
 		return self.scissorW
 	elseif offset == 0x34 then
 		return self.scissorH
+	elseif offset == 0x38 then
+		return self.tileCount
+	elseif offset == 0x3C then
+		return self:floatBits(self.scale)
 	end
 	return 0
 end
@@ -165,6 +230,10 @@ function Gpu:writeRegister(offset: number, value: number)
 		self.scissorW = value
 	elseif offset == 0x34 then
 		self.scissorH = value
+	elseif offset == 0x38 then
+		self:setTileCount(value)
+	elseif offset == 0x3C then
+		self:setResolutionScale(self:bitsFloat(value))
 	end
 end
 
@@ -204,14 +273,26 @@ function Gpu:execute(command: number)
 		self.raster.colourBase = destination
 		self.raster.depthBase = self.depthAddress
 		self:applyScissor(command)
-		self.raster:drawMesh(
-			memory:read32(command + F_SRC),
-			memory:read32(command + F_MATRIX),
-			memory:read32(command + F_SHADING),
-			memory:read32(command + F_TEXTURE),
-			bit32.band(memory:read32(command + F_FLAGS), 1) ~= 0,
-			self.near
-		)
+		if self.tileCount > 1 then
+			self.raster:drawMeshTiled(
+				self.tileCount,
+				memory:read32(command + F_SRC),
+				memory:read32(command + F_MATRIX),
+				memory:read32(command + F_SHADING),
+				memory:read32(command + F_TEXTURE),
+				bit32.band(memory:read32(command + F_FLAGS), 1) ~= 0,
+				self.near
+			)
+		else
+			self.raster:drawMesh(
+				memory:read32(command + F_SRC),
+				memory:read32(command + F_MATRIX),
+				memory:read32(command + F_SHADING),
+				memory:read32(command + F_TEXTURE),
+				bit32.band(memory:read32(command + F_FLAGS), 1) ~= 0,
+				self.near
+			)
+		end
 	elseif op == Gpu.OP.PRESENT then
 		if self.framebuffer ~= nil then
 			self.framebuffer.presentRequested = true

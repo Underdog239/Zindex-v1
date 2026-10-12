@@ -35,7 +35,9 @@ a handful of registers.
 | 0x0F003000 | AUDIO | ring buffer descriptor (base, length, read/write cursors) |
 | 0x0F004000 | IPC | shared-region descriptor, core id, atomics |
 | 0x0F005000 | FB | framebuffer descriptor |
-| 0x0F006000+ | user | reserved for future devices |
+| 0x0F006000 | GPU | Avalon R1 graphics command queue and registers |
+| 0x0F007000 | NPU | Z-NPU tensor / vector / DMA command queue and registers |
+| 0x0F008000+ | user | reserved for future devices |
 
 Reading a device register is an ordinary LW. There is no separate I/O instruction class, so
 there is no second decode path to maintain.
