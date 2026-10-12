@@ -68,19 +68,33 @@ function Image.unpack(blob: buffer): Program
 	if not Image.isImage(blob) then
 		error('image: bad magic', 0)
 	end
+	local blobSize = buffer.len(blob)
 	local codeSize = buffer.readu32(blob, 0x10)
 	local codeAddress = buffer.readu32(blob, 0x14)
+	local ramSize = buffer.readu32(blob, 0x08)
+	local entry = buffer.readu32(blob, 0x04)
+	local available = blobSize - Image.HEADER_SIZE
+	if codeSize > available then
+		error('image: truncated code section', 0)
+	end
+	local dataSize = available - codeSize
+	local dataAddress = codeAddress + codeSize
+	if codeSize > 4294967296 - codeAddress or dataSize > 4294967296 - dataAddress then
+		error('image: address range overflows the 32-bit address space', 0)
+	end
+	if ramSize > 0 and (dataAddress + dataSize > ramSize or entry >= ramSize) then
+		error('image: segment or entry point exceeds declared RAM', 0)
+	end
+
 	local code = buffer.create(codeSize)
 	buffer.copy(code, 0, blob, Image.HEADER_SIZE, codeSize)
-	local dataAddress = codeAddress + codeSize
-	local dataSize = buffer.len(blob) - Image.HEADER_SIZE - codeSize
-	local data = buffer.create(if dataSize > 0 then dataSize else 1)
+	local data = buffer.create(dataSize)
 	if dataSize > 0 then
 		buffer.copy(data, 0, blob, Image.HEADER_SIZE + codeSize, dataSize)
 	end
 	return {
-		entry = buffer.readu32(blob, 0x04),
-		ramSize = buffer.readu32(blob, 0x08),
+		entry = entry,
+		ramSize = ramSize,
 		profile = buffer.readu32(blob, 0x0C),
 		codeAddress = codeAddress,
 		code = code,

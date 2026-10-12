@@ -133,6 +133,55 @@ do
 	eq('load half sign extends', chip:reg(10), 4294934528)
 end
 
+do
+	local memory = Zindex.Memory.new(16)
+	local trapCalls = {}
+	memory.onTrap = function(reason, address)
+		trapCalls[#trapCalls + 1] = { reason, address }
+	end
+	memory:write32(8, 0x12345678)
+	memory:write8(15, 0xA5)
+	eq('full word in RAM is accessible', memory:read32(8), 0x12345678)
+	eq('one-byte final range is valid', memory:containsRange(15, 1), true)
+	eq('crossing RAM range is invalid', memory:containsRange(15, 2), false)
+	eq('out-of-range halfword read is harmless', memory:read16(15), 0)
+	eq('out-of-range word read is harmless', memory:read32(13), 0)
+	eq('out-of-range float read is harmless', memory:readf32(13), 0)
+	memory:write16(15, 0xFFFF)
+	memory:write32(13, 0xFFFFFFFF)
+	memory:writef32(13, 1.0)
+	eq('cross-boundary writes leave final RAM byte intact', memory:read8(15), 0xA5)
+	eq('all rejected reads and writes are counted as faults', memory.faults, 6)
+	eq('memory fault callback observes reads and writes', #trapCalls, 6)
+	eq('memory fault callback receives its reason code', trapCalls[1][1], Zindex.Memory.FAULT.INVALID_ACCESS)
+	eq('memory fault callback receives the address', trapCalls[6][2], 13)
+end
+do
+	local observed = {}
+	local chip = Zindex.new({
+		ramSize = 16,
+		onMemoryTrap = function(machine, core, reason, address)
+			observed[#observed + 1] = { core, reason, address }
+		end,
+	})
+	chip.memory:read8(16)
+	chip.memory:write8(32, 0)
+	chip.memory:read8(Zindex.Devices.PAGE.INPUT) -- this page exposes word-only registers
+	chip.memory:read32(0x0F008000) -- unimplemented device page
+	eq('Zindex wires invalid RAM and MMIO accesses to the host callback', #observed, 4)
+	eq('host memory callback is distinct from an ECALL core trap', observed[1][1], nil)
+	eq('host memory callback gets the RAM fault address', observed[2][3], 32)
+	eq('unsupported MMIO widths are faulted', observed[3][3], Zindex.Devices.PAGE.INPUT)
+	eq('unimplemented MMIO pages are faulted', observed[4][3], 0x0F008000)
+	local root = Zindex.Memory.new(16)
+	root:registerDevice(Zindex.Memory.DEVICE_BASE, {
+		read32 = function(offset)
+			return offset
+		end,
+	})
+	eq('explicit root devices still receive window offsets', root:read32(Zindex.Memory.DEVICE_BASE + 0x1000), 0x1000)
+end
+
 --=====================================================================
 -- Control flow
 --=====================================================================
@@ -189,6 +238,90 @@ do
 	chip:run(200)
 	eq('replay from a save state is exact', buffer.readu32(chip:ram(), 0x9000), advanced)
 	eq('replay leaves the same cycle count', chip:cycles(), second.cycles)
+end
+do
+	local chip = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000 })
+	chip:assemble[[halt]]
+	chip:setReg(1, 0x12345678)
+	chip.core.stats.blocksCompiled = 7
+	chip.memory:write32(0x300, 0xAABBCCDD)
+	chip.memory:read8(0x10000)
+	chip.devices.timer.compare = 1234
+	chip.devices.timer.reload = 17
+	chip.devices.timer.fired = 9
+	chip.devices.audio.readCursor = 3
+	chip.devices.audio.writeCursor = 7
+	chip.devices.input.buttons = 5
+	chip.gpu.queueBase = 0x8000
+	chip.gpu.queueCount = 2
+	chip.gpu.pending = true
+	chip.gpu.status = 1
+	chip.gpu.queueFaults = 4
+	chip.gpu.raster.stats.triangles = 11
+	chip.gpu.raster:setScissor(2, 3, 4, 5)
+	chip.npu.queueBase = 0x9000
+	chip.npu.queueCount = 3
+	chip.npu.pending = true
+	chip.npu.status = 1
+	chip.npu.queueFaults = 6
+	chip.npu.stats.vectorOps = 13
+	local state = chip:snapshot()
+
+	chip:setReg(1, 0)
+	chip.core.stats.blocksCompiled = 0
+	chip.memory:read8(0x10001)
+	chip.memory:write32(0x300, 0)
+	chip.devices.timer.compare = 0
+	chip.devices.timer.reload = 0
+	chip.devices.timer.fired = 0
+	chip.devices.audio.readCursor = 0
+	chip.devices.audio.writeCursor = 0
+	chip.devices.input.buttons = 0
+	chip.gpu.queueBase = 0
+	chip.gpu.queueCount = 0
+	chip.gpu.pending = false
+	chip.gpu.status = 0
+	chip.gpu.queueFaults = 0
+	chip.gpu.raster.stats.triangles = 0
+	chip.gpu.raster:setScissor(0, 0, 16, 16)
+	chip.npu.queueBase = 0
+	chip.npu.queueCount = 0
+	chip.npu.pending = false
+	chip.npu.status = 0
+	chip.npu.queueFaults = 0
+	chip.npu.stats.vectorOps = 0
+	chip:restore(state)
+
+	eq('save state restores core registers', chip:reg(1), 0x12345678)
+	eq('save state restores core statistics after cache invalidation', chip.core.stats.blocksCompiled, 7)
+	eq('save state restores RAM', buffer.readu32(chip:ram(), 0x300), 0xAABBCCDD)
+	eq('save state restores memory fault counters', chip.memory.faults, 1)
+	eq('save state restores timer registers', chip.devices.timer.compare, 1234)
+	eq('save state restores audio cursors', chip.devices.audio.readCursor + chip.devices.audio.writeCursor, 10)
+	eq('save state restores input state', chip.devices.input.buttons, 5)
+	eq('save state restores GPU queue and faults', chip.gpu.queueBase + chip.gpu.queueFaults, 0x8004)
+	eq('save state restores GPU raster statistics', chip.gpu.raster.stats.triangles, 11)
+	eq('save state restores GPU scissor', chip.gpu.raster.scissorW + chip.gpu.raster.scissorH, 9)
+	eq('save state restores NPU queue and faults', chip.npu.queueBase + chip.npu.queueFaults, 0x9006)
+	eq('save state restores NPU statistics', chip.npu.stats.vectorOps, 13)
+end
+do
+	local cluster = Zindex.new({ ramSize = 0x10000, coreCount = 2, sharedWords = 16 })
+	cluster:assemble[[halt]]
+	cluster:setReg(1, 11, 1)
+	cluster:setReg(1, 22, 2)
+	cluster:writeShared(3, 0xABCDEF01)
+	buffer.writeu32(cluster:ram(2), 0x300, 0x11223344)
+	local state = cluster:snapshot()
+	cluster:setReg(1, 0, 1)
+	cluster:setReg(1, 0, 2)
+	cluster:writeShared(3, 0)
+	buffer.writeu32(cluster:ram(2), 0x300, 0)
+	cluster:restore(state)
+	eq('multi-core save state restores core 1', cluster:reg(1, 1), 11)
+	eq('multi-core save state restores core 2', cluster:reg(1, 2), 22)
+	eq('multi-core save state restores shared memory', cluster:readShared(3), 0xABCDEF01)
+	eq('multi-core save state restores private RAM', buffer.readu32(cluster:ram(2), 0x300), 0x11223344)
 end
 
 --=====================================================================
@@ -380,6 +513,41 @@ do
 	chip:loadImage(blob)
 	chip:run(100)
 	eq('image runs', chip:reg(1), 7)
+
+	local noDataBlob = Image.pack({
+		entry = 0x1000,
+		code = buffer.fromstring(string.char(0x52)),
+		codeAddress = 0x1000,
+		ramSize = 0x2000,
+	})
+	local noDataProgram = Image.unpack(noDataBlob)
+	eq('empty image data stays empty', buffer.len(noDataProgram.data), 0)
+	local guardedChip = newChip(0x2000)
+	buffer.writeu8(guardedChip:ram(), 0x1001, 0xA5)
+	guardedChip:loadImage(noDataBlob)
+	eq('empty data section does not overwrite following RAM', buffer.readu8(guardedChip:ram(), 0x1001), 0xA5)
+
+	local truncatedImage = buffer.create(Image.HEADER_SIZE)
+	buffer.writeu32(truncatedImage, 0, Image.MAGIC)
+	buffer.writeu32(truncatedImage, 0x10, 0xFFFFFFFF)
+	local truncatedOk = pcall(function()
+		Image.unpack(truncatedImage)
+	end)
+	eq('truncated image is rejected before allocation', truncatedOk, false)
+
+	local badLoadBlob = Image.pack({
+		entry = 0x1FFF,
+		code = buffer.fromstring(string.char(0x52)),
+		codeAddress = 0x1FFF,
+		data = buffer.fromstring('DATA'),
+	})
+	local guardedLoadChip = newChip(0x2000)
+	buffer.writeu8(guardedLoadChip:ram(), 0x1FFF, 0xA5)
+	local badLoadOk = pcall(function()
+		guardedLoadChip:loadImage(badLoadBlob)
+	end)
+	eq('out-of-RAM image data is rejected', badLoadOk, false)
+	eq('failed image load does not copy partial code', buffer.readu8(guardedLoadChip:ram(), 0x1FFF), 0xA5)
 end
 
 --=====================================================================
@@ -592,6 +760,39 @@ do
 	eq('guest-drawn pixel', buffer.readu32(chip:ram(), 0x4000 + (5 * 16 + 2) * 4), 0xFFFFFFFF)
 	check('guest asked for a present', chip.devices.framebuffer.presentRequested == true)
 	eq('gpu status is done', chip.gpu.status, 2)
+end
+
+do
+	local chip = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000 })
+	local page = Zindex.Gpu.PAGE
+	chip.memory:write32(page, 0x8000)
+	chip.memory:write32(page + 4, Zindex.Gpu.MAX_QUEUE_COMMANDS + 1)
+	chip.memory:write32(page + 8, 1)
+	eq('oversized GPU queue is not drained', chip:pumpGpu(), 0)
+	eq('oversized GPU queue reports fault status', chip.gpu.status, 3)
+
+	local ram = chip:ram()
+	buffer.writeu32(ram, 0x4000, 0xAABBCCDD)
+	buffer.writef32(ram, 0x5000, 0.5)
+	chip.gpu.tileCount = 2
+	buffer.writeu32(ram, 0x8000, Zindex.Gpu.OP.DRAW_MESH)
+	buffer.writeu32(ram, 0x8004, 0xFFF8) -- descriptor crosses the end of RAM
+	buffer.writeu32(ram, 0x8010, 0x7000)
+	chip.memory:write32(page + 4, 1)
+	chip.memory:write32(page + 8, 1)
+	chip:pumpGpu()
+	eq('malformed GPU mesh is rejected', chip.gpu.status, 3)
+	eq('malformed tiled draw leaves colour target unchanged', buffer.readu32(ram, 0x4000), 0xAABBCCDD)
+	eq('GPU queue faults are counted', chip.gpu.queueFaults, 2)
+	chip.gpu.raster:setScissor(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+	eq('guest scissor is clipped to viewport', chip.gpu.raster.scissorW + chip.gpu.raster.scissorH, 0)
+	local oldBudget = Zindex.Raster.MAX_WORK
+	Zindex.Raster.MAX_WORK = 1
+	chip.memory:write32(page + 4, 1)
+	chip.memory:write32(page + 8, 1)
+	chip:pumpGpu()
+	Zindex.Raster.MAX_WORK = oldBudget
+	eq('tiled GPU work is bounded per pump', chip.gpu.status, 3)
 end
 
 --=====================================================================
@@ -840,6 +1041,30 @@ do
 	eq('npu 3-lane vector ops count', chip.npu.stats.vectorOps, 13)
 end
 
+do
+	local chip = newChip(0x10000)
+	local page = Zindex.Npu.PAGE
+	chip.memory:write32(page, 0x8000)
+	chip.memory:write32(page + 4, Zindex.Npu.MAX_QUEUE_COMMANDS + 1)
+	chip.memory:write32(page + 8, 1)
+	eq('oversized NPU queue is not drained', chip:pumpNpu(), 0)
+	eq('oversized NPU queue reports fault status', chip.npu.status, 3)
+
+	local ram = chip:ram()
+	buffer.writeu32(ram, 0x8000, Zindex.Npu.OP.DOT_BATCH)
+	buffer.writeu32(ram, 0x8004, 0xFFF8) -- 12-byte vector would cross RAM end
+	buffer.writeu32(ram, 0x8008, 0x9010)
+	buffer.writeu32(ram, 0x800C, 1)
+	buffer.writeu32(ram, 0x8010, 0x9000)
+	buffer.writeu32(ram, 0x9010, 0xDEADBEEF)
+	chip.memory:write32(page + 4, 1)
+	chip.memory:write32(page + 8, 1)
+	chip:pumpNpu()
+	eq('NPU out-of-range batch is rejected', chip.npu.status, 3)
+	eq('invalid NPU batch does not modify destination', buffer.readu32(ram, 0x9010), 0xDEADBEEF)
+	eq('NPU queue faults are counted', chip.npu.queueFaults, 2)
+end
+
 --=====================================================================
 -- Multi-core execution, shared memory (LWS/SWS/AMOADD) and SYNC barrier
 --=====================================================================
@@ -894,9 +1119,14 @@ do
 	local tiled = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000, tileCount = 4 })
 	scene(tiled)
 	tiled.gpu.raster:clear(0xFF000000)
+	local untouchedPixel = 0xFF112233
+	local untouchedOffset = 0x4000 + (0 * 16 + 15) * 4
+	buffer.writeu32(single:ram(), untouchedOffset, untouchedPixel)
+	buffer.writeu32(tiled:ram(), untouchedOffset, untouchedPixel)
 	tiled.gpu.raster:drawMeshTiled(4, 0x6200, 0x6000, 0, 0, false, 0.0001)
 
 	eq('tiled rasteriser composited 4 tiles', tiled.gpu.raster.stats.tilesComposited, 4)
+	eq('tiled draw preserves untouched target pixels', buffer.readu32(tiled:ram(), untouchedOffset), untouchedPixel)
 	local match = true
 	for i = 0, 16 * 16 - 1 do
 		if buffer.readu32(single:ram(), 0x4000 + i * 4) ~= buffer.readu32(tiled:ram(), 0x4000 + i * 4) then
@@ -958,6 +1188,16 @@ end
 
 do
 	local chip = newChip(0x10000)
+	chip.devices.timer.compare = 1
+	chip.devices.timer.reload = 1
+	chip.devices.timer.control = 1
+	chip.devices.tick(1000000000)
+	eq('recurring timer skips missed periods in constant time', chip.devices.timer.compare, 1000000001)
+	eq('timer fired count includes missed periods', chip.devices.timer.fired, 1000000000)
+end
+
+do
+	local chip = newChip(0x10000)
 	chip:assemble[[
 			.org 0x7000
 		samples:
@@ -982,6 +1222,17 @@ do
 	eq('audio sample 3', pulled[3], 0.75)
 	eq('audio sample 4', pulled[4], 1.0)
 	eq('audio read cursor advanced to 4', chip.devices.audio.readCursor, 4)
+end
+
+do
+	local chip = newChip(0x10000)
+	local page = Zindex.Devices.PAGE.AUDIO
+	chip.memory:write32(page, 0x1000)
+	chip.memory:write32(page + 4, 0xFFFFFFFF)
+	chip.memory:write32(page + 0x0C, 0xFFFFFFFF)
+	eq('guest audio ring length is capped by available RAM', chip.devices.audio.length, 0x4000)
+	local pulled = chip:pullAudio()
+	eq('one audio pull is bounded even for guest-controlled rings', #pulled, 4096)
 end
 
 --=====================================================================

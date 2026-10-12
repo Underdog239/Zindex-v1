@@ -31,6 +31,7 @@ export type State = {
 	ram: buffer,
 	ramSize: number,
 	devices: { [number]: Device },
+	rootDevice: Device?,
 	lastCost: number,
 	faults: number,
 	codeLow: number,
@@ -52,12 +53,16 @@ Memory.RAM_BASE = 0x00000000
 Memory.DEVICE_BASE = 0x0F000000
 Memory.DEVICE_END = 0x10000000
 Memory.TRAP_BASE = 0xFF000000
+Memory.FAULT = {
+	INVALID_ACCESS = 1,
+}
 
 function Memory.new(ramSize: number): Class
 	local self = setmetatable({}, Memory) :: any
 	self.ramSize = ramSize
 	self.ram = buffer.create(ramSize)
 	self.devices = {}
+	self.rootDevice = nil
 	self.lastCost = 1
 	self.faults = 0
 	self.codeLow = 0xFFFFFFFF
@@ -70,13 +75,34 @@ function Memory.new(ramSize: number): Class
 	return self
 end
 
---- Attach a device to a 4 KiB page, or to Memory.DEVICE_BASE to own the window.
+--- Attach a device to a 4 KiB page, or to Memory.DEVICE_BASE to own the whole window.
 function Memory.registerDevice(self: Class, pageBase: number, device: Device)
+	if pageBase == Memory.DEVICE_BASE then
+		self.rootDevice = device
+	else
+		self.devices[pageBase] = device
+	end
+end
+
+--- Attach a page-local device at DEVICE_BASE without making it the window fallback.
+function Memory.registerPageDevice(self: Class, pageBase: number, device: Device)
 	self.devices[pageBase] = device
 end
 
 function Memory.getRam(self: Class): buffer
 	return self.ram
+end
+
+--- Return whether a byte range is wholly contained in RAM. This is also used
+--- by image, DMA, and accelerator input validation before touching raw buffers.
+function Memory.containsRange(self: Class, address: number, size: number): boolean
+	if address ~= address or size ~= size or address % 1 ~= 0 or size % 1 ~= 0 then
+		return false
+	end
+	if address < 0 or size < 0 or address > self.ramSize then
+		return false
+	end
+	return size <= self.ramSize - address
 end
 
 --- Record that a compiled basic block covers `[startAddress, endAddress)`.
@@ -109,7 +135,14 @@ end
 function Memory.copyIn(self: Class, address: number, source: buffer, sourceOffset: number?, count: number?)
 	local offset = sourceOffset or 0
 	local len = count or (buffer.len(source) - offset)
-	buffer.copy(self.ram, address, source, offset, count)
+	local sourceSize = buffer.len(source)
+	if offset < 0 or offset % 1 ~= 0 or len < 0 or len % 1 ~= 0 or offset > sourceSize or len > sourceSize - offset then
+		error('memory: source copy range is outside its buffer', 0)
+	end
+	if not self:containsRange(address, len) then
+		error('memory: destination copy range is outside RAM', 0)
+	end
+	buffer.copy(self.ram, address, source, offset, len)
 	if address < self.codeHigh and address + len > self.codeLow then
 		self:notifyCodeWrite(address, len)
 	else
@@ -201,7 +234,7 @@ local function resolve(self: Class, address: number): (Device?, number)
 	if device ~= nil then
 		return device, address - page
 	end
-	local root = self.devices[Memory.DEVICE_BASE]
+	local root = self.rootDevice
 	if root ~= nil then
 		return root, address - Memory.DEVICE_BASE
 	end
@@ -210,6 +243,12 @@ end
 
 local function isDevice(address: number): boolean
 	return address >= Memory.DEVICE_BASE and address < Memory.DEVICE_END
+end
+
+local function notifyFault(self: Class, address: number)
+	if self.onTrap ~= nil then
+		self.onTrap(Memory.FAULT.INVALID_ACCESS, address)
+	end
 end
 
 function Memory.read8(self: Class, address: number): number
@@ -224,54 +263,57 @@ function Memory.read8(self: Class, address: number): number
 		if device ~= nil and device.read8 ~= nil then
 			return device.read8(offset)
 		end
+		self.faults += 1
+		notifyFault(self, address)
 		return 0
 	end
 	self.lastCost = 4
-	if self.onTrap ~= nil then
-		self.onTrap(address, address)
-	end
+	self.faults += 1
+	notifyFault(self, address)
 	return 0
 end
 
 function Memory.read16(self: Class, address: number): number
 	address = address % WRAP
-	if address < self.ramSize then
+	if address <= self.ramSize - 2 then
 		self.lastCost = 1
 		return buffer.readu16(self.ram, address)
 	end
-	if isDevice(address) then
+	if isDevice(address) and address <= Memory.DEVICE_END - 2 then
 		self.lastCost = 4
 		local device, offset = resolve(self, address)
 		if device ~= nil and device.read16 ~= nil then
 			return device.read16(offset)
 		end
+		self.faults += 1
+		notifyFault(self, address)
 		return 0
 	end
 	self.lastCost = 4
-	if self.onTrap ~= nil then
-		self.onTrap(address, address)
-	end
+	self.faults += 1
+	notifyFault(self, address)
 	return 0
 end
 
 function Memory.read32(self: Class, address: number): number
 	address = address % WRAP
-	if address < self.ramSize then
+	if address <= self.ramSize - 4 then
 		self.lastCost = 1
 		return buffer.readu32(self.ram, address)
 	end
-	if isDevice(address) then
+	if isDevice(address) and address <= Memory.DEVICE_END - 4 then
 		self.lastCost = 4
 		local device, offset = resolve(self, address)
 		if device ~= nil and device.read32 ~= nil then
 			return device.read32(offset)
 		end
+		self.faults += 1
+		notifyFault(self, address)
 		return 0
 	end
 	self.lastCost = 4
-	if self.onTrap ~= nil then
-		self.onTrap(address, address)
-	end
+	self.faults += 1
+	notifyFault(self, address)
 	return 0
 end
 
@@ -290,16 +332,20 @@ function Memory.write8(self: Class, address: number, value: number)
 		local device, offset = resolve(self, address)
 		if device ~= nil and device.write8 ~= nil then
 			device.write8(offset, value % 256)
+			return
 		end
+		self.faults += 1
+		notifyFault(self, address)
 		return
 	end
 	self.lastCost = 4
 	self.faults += 1
+	notifyFault(self, address)
 end
 
 function Memory.write16(self: Class, address: number, value: number)
 	address = address % WRAP
-	if address < self.ramSize then
+	if address <= self.ramSize - 2 then
 		self.lastCost = 1
 		buffer.writeu16(self.ram, address, value)
 		if address < self.codeHigh and address + 2 > self.codeLow then
@@ -307,21 +353,25 @@ function Memory.write16(self: Class, address: number, value: number)
 		end
 		return
 	end
-	if isDevice(address) then
+	if isDevice(address) and address <= Memory.DEVICE_END - 2 then
 		self.lastCost = 4
 		local device, offset = resolve(self, address)
 		if device ~= nil and device.write16 ~= nil then
 			device.write16(offset, value % 65536)
+			return
 		end
+		self.faults += 1
+		notifyFault(self, address)
 		return
 	end
 	self.lastCost = 4
 	self.faults += 1
+	notifyFault(self, address)
 end
 
 function Memory.write32(self: Class, address: number, value: number)
 	address = address % WRAP
-	if address < self.ramSize then
+	if address <= self.ramSize - 4 then
 		self.lastCost = 1
 		buffer.writeu32(self.ram, address, value)
 		if address < self.codeHigh and address + 4 > self.codeLow then
@@ -329,34 +379,37 @@ function Memory.write32(self: Class, address: number, value: number)
 		end
 		return
 	end
-	if isDevice(address) then
+	if isDevice(address) and address <= Memory.DEVICE_END - 4 then
 		self.lastCost = 4
 		local device, offset = resolve(self, address)
 		if device ~= nil and device.write32 ~= nil then
 			device.write32(offset, value % WRAP)
+			return
 		end
+		self.faults += 1
+		notifyFault(self, address)
 		return
 	end
 	self.lastCost = 4
 	self.faults += 1
+	notifyFault(self, address)
 end
 
 function Memory.readf32(self: Class, address: number): number
 	address = address % WRAP
-	if address < self.ramSize then
+	if address <= self.ramSize - 4 then
 		self.lastCost = 1
 		return buffer.readf32(self.ram, address)
 	end
 	self.lastCost = 4
-	if self.onTrap ~= nil then
-		self.onTrap(address, address)
-	end
+	self.faults += 1
+	notifyFault(self, address)
 	return 0
 end
 
 function Memory.writef32(self: Class, address: number, value: number)
 	address = address % WRAP
-	if address < self.ramSize then
+	if address <= self.ramSize - 4 then
 		self.lastCost = 1
 		buffer.writef32(self.ram, address, value)
 		if address < self.codeHigh and address + 4 > self.codeLow then
@@ -366,6 +419,7 @@ function Memory.writef32(self: Class, address: number, value: number)
 	end
 	self.lastCost = 4
 	self.faults += 1
+	notifyFault(self, address)
 end
 
 return Memory

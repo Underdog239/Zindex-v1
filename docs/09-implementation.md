@@ -32,7 +32,7 @@ python3 Tests/bundle.py && luau --codegen Tests/combined.luau
 
 `Tests/bundle.py` rewrites `require(script.Parent.X)` into a module table so the
 library runs unchanged outside Roblox, then appends `Tests/suite.luau`. The
-suite drives the real core through the real assembler; nothing is mocked. **157
+suite drives the real core through the real assembler; nothing is mocked. **212
 checks, all passing** under both the Luau interpreter and `--codegen` native
 code generation, and every module in `src/Zindex/*.luau` compiles cleanly with
 `luau-compile --codegen`.
@@ -60,11 +60,17 @@ Covered:
   `buffer.copy` compositing** (verified pixel-identical to single-tile), and
   **adaptive resolution scaling** (`gpu:adapt`).
 - **Timer interrupts and Audio ring buffer**: timer compare firing a guest
-  interrupt vector (`0x0F00000C`) and callback, and guest code filling the `AUDIO`
-  ring buffer followed by `chip:pullAudio()`.
+  interrupt vector (`0x0F00000C`) and callback, recurring timer catch-up in
+  constant time, and bounded pulls from guest-configured audio rings.
+- **Guest-input hardening**: cross-boundary memory reads/writes and wired host
+  memory-fault callbacks, malformed images, empty image data, image-load atomicity,
+  invalid GPU/NPU pointers, oversized accelerator queues, and queue fault statuses.
+- **Save-state coverage**: replay determinism plus single-/multi-core snapshots
+  restoring device registers, accelerator queues/statistics, shared memory, core
+  registers, and private RAM.
 - **Assembler conveniences**: `.equ` constants, `.macro`/`.endm` expansion with
   local labels, scientific-notation floats (`1e-3`, `-2.5e-2`, `1.5e+2`), image
-  round trip, illegal opcode handling, and byte-exact save state replay.
+  round trip, and illegal opcode handling.
 
 `Examples/demo.luau` fills a framebuffer from machine code and asks the host to
 present. `Examples/gpu.luau` uploads a mesh and a matrix, then has guest code

@@ -177,14 +177,16 @@ function Devices.attach(memory: Memory.Class, options: {
 		if bit32.band(timer.control, 1) ~= 0 and timer.compare > 0 then
 			local now = if nowCycles ~= nil then nowCycles else timer.clock()
 			if now >= timer.compare then
-				timer.fired += 1
 				dev.pending = bit32.bor(dev.pending, Devices.IRQ.TIMER)
 				if timer.reload > 0 then
-					local step = timer.reload
-					while timer.compare <= now do
-						timer.compare += step
-					end
+					-- Advance by all elapsed periods in constant time. The guest
+					-- controls reload, so a per-period loop would let reload=1 turn
+					-- a timer read into work proportional to the chip's uptime.
+					local elapsed = math.floor((now - timer.compare) / timer.reload) + 1
+					timer.fired = (timer.fired + elapsed) % WRAP
+					timer.compare += elapsed * timer.reload
 				else
+					timer.fired = (timer.fired + 1) % WRAP
 					timer.control = bit32.band(timer.control, bit32.bnot(1))
 				end
 			end
@@ -199,7 +201,7 @@ function Devices.attach(memory: Memory.Class, options: {
 		end
 	end
 
-	memory:registerDevice(Devices.PAGE.DEV, registers(function(offset: number): number
+	memory:registerPageDevice(Devices.PAGE.DEV, registers(function(offset: number): number
 		if offset == 0x00 then
 			return tick(nil)
 		elseif offset == 0x04 then
@@ -297,7 +299,14 @@ function Devices.attach(memory: Memory.Class, options: {
 		if offset == 0x00 then
 			audio.base = value
 		elseif offset == 0x04 then
-			audio.length = value
+			audio.length = math.min(value, math.floor(memory.ramSize / 4))
+			if audio.length > 0 then
+				audio.readCursor %= audio.length
+				audio.writeCursor %= audio.length
+			else
+				audio.readCursor = 0
+				audio.writeCursor = 0
+			end
 		elseif offset == 0x08 then
 			audio.readCursor = if audio.length > 0 then value % audio.length else value
 		elseif offset == 0x0C then

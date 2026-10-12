@@ -48,7 +48,7 @@ Registers:
 | +0x00 | queue base address |
 | +0x04 | queue length in commands |
 | +0x08 | kick, write 1 to run the queue; reads 1 while work is pending |
-| +0x0C | status: 0 idle, 1 pending, 2 done |
+| +0x0C | status: 0 idle, 1 pending, 2 done, 3 rejected/limited |
 | +0x10 | commands run (stat) |
 | +0x14 | triangles submitted (stat) |
 | +0x18 | fragments written (stat) |
@@ -70,6 +70,13 @@ Commands, 48 bytes each (see doc 05 for the field list):
 | `DRAW_MESH` (3) | `src` mesh, `matrix` matrix, `texture` texture, `shading` mode, `flags` culling |
 | `PRESENT` (4) | request this frame's single upload |
 | `SET_COLOUR` (5) | `src` becomes the colour plane address |
+
+Guest queues are limited to 256 commands and the complete queue must fit in RAM. Each pump has
+a 1,000,000-unit raster budget (screen-space candidate pixels, submitted triangle
+work, and tiled viewport copying), scissor rectangles are clipped to the viewport,
+and each mesh is limited to 8,192 triangles.
+Mesh, matrix, texture, colour, depth, index, and attribute ranges are checked before raw buffer
+access. Invalid descriptors or exhausted work set status 3 and stop draining the queue.
 
 The colour and depth planes live in RAM, so the rasteriser writes straight into
 the guest's framebuffer with no intermediate copy.

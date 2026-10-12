@@ -62,3 +62,7 @@ Implemented on page `0x0F007000`, fed with the same 48-byte command format as th
 | `DMA_COPY` (6) | bulk `buffer.copy` of `count` bytes from `src` to `dst` |
 | `DMA_FILL` (7) | bulk `buffer.fill` of `count` bytes at `dst` with byte `src` |
 
+The queue is limited to 256 commands and 262,144 total work units per pump. Every command and
+operand span is validated against RAM before it touches a raw buffer; oversized batches, invalid
+addresses, and unsupported opcodes are rejected with status 3 instead of throwing or spinning.
+

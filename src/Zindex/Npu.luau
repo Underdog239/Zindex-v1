@@ -14,7 +14,7 @@
 		+0x00  queue base address
 		+0x04  queue length in commands
 		+0x08  kick, write 1 to run the queue; reads 1 while pending
-		+0x0C  status: 0 idle, 1 pending, 2 done
+		+0x0C  status: 0 idle, 1 pending, 2 done, 3 rejected/limited
 		+0x10  commands run (stat)
 		+0x14  3-lane vector operations executed (stat)
 		+0x18  output elements written (stat)
@@ -32,6 +32,8 @@ Npu.__index = Npu
 
 Npu.PAGE = 0x0F007000
 Npu.COMMAND_SIZE = 48
+Npu.MAX_QUEUE_COMMANDS = 256
+Npu.MAX_QUEUE_WORK = 262144
 
 Npu.OP = {
 	NOP = 0,
@@ -72,6 +74,7 @@ export type State = {
 	pending: boolean,
 	status: number,
 	commandsRun: number,
+	queueFaults: number,
 	stats: Stats,
 	scratch: buffer,
 }
@@ -88,6 +91,7 @@ function Npu.attach(memory: Memory.Class): Class
 	self.pending = false
 	self.status = 0
 	self.commandsRun = 0
+	self.queueFaults = 0
 	self.stats = {
 		vectorOps = 0,
 		elements = 0,
@@ -355,12 +359,38 @@ function Npu.dequantInt8(self: Class, src: number, dst: number, count: number, s
 	self.stats.elements += count
 end
 
-function Npu.execute(self: Class, command: number)
+local function productWithinLimit(a: number, b: number, limit: number): number?
+	if a < 0 or b < 0 then
+		return nil
+	end
+	if a == 0 or b == 0 then
+		return 0
+	end
+	if a > math.floor(limit / b) then
+		return nil
+	end
+	return a * b
+end
+
+local function arrayRangeFits(memory: Memory.Class, address: number, count: number, stride: number): boolean
+	if count < 0 or count % 1 ~= 0 then
+		return false
+	end
+	return memory:containsRange(address, count * stride)
+end
+
+--- Validate and execute one guest command, returning whether it was accepted and
+--- how much of the queue's bounded work budget it consumed.
+function Npu.execute(self: Class, command: number, workBudget: number?): (boolean, number)
 	local memory = self.memory
+	if not memory:containsRange(command, Npu.COMMAND_SIZE) then
+		return false, 0
+	end
 	local op = memory:read32(command + F_OP)
 	if op == Npu.OP.NOP then
-		return
+		return true, 0
 	end
+
 	local src = memory:read32(command + F_SRC)
 	local dst = memory:read32(command + F_DST)
 	local count = memory:read32(command + F_COUNT)
@@ -369,23 +399,83 @@ function Npu.execute(self: Class, command: number)
 	local mode = memory:read32(command + F_MODE)
 	local flags = memory:read32(command + F_FLAGS)
 	local relu = bit32.band(flags, 1) ~= 0
+	local remaining = if workBudget ~= nil then math.min(workBudget, Npu.MAX_QUEUE_WORK) else Npu.MAX_QUEUE_WORK
+	local work = 0
 
 	if op == Npu.OP.DOT_BATCH then
+		if count > math.floor(remaining / 3)
+			or not arrayRangeFits(memory, src, count, 12)
+			or not arrayRangeFits(memory, matrix, count, 12)
+			or not arrayRangeFits(memory, dst, count, 4)
+		then
+			return false, 0
+		end
+		work = count * 3
 		self:dotBatch(src, matrix, dst, count)
 	elseif op == Npu.OP.FMA_BATCH then
+		local addBase = if aux ~= 0 then aux else dst
+		if (mode ~= 0 and mode ~= 1)
+			or count > math.floor(remaining / 3)
+			or not arrayRangeFits(memory, src, count, 12)
+			or not arrayRangeFits(memory, addBase, count, 12)
+			or not arrayRangeFits(memory, dst, count, 12)
+			or (mode == 0 and not arrayRangeFits(memory, matrix, count, 12))
+		then
+			return false, 0
+		end
+		work = count * 3
 		self:fmaBatch(src, matrix, aux, dst, count, mode, relu)
 	elseif op == Npu.OP.GEMM then
 		local nCols = memory:read32(command + F_N)
 		local kInner = memory:read32(command + F_K)
 		local tileStart = memory:read32(command + F_TILE_START)
 		local tileRows = memory:read32(command + F_TILE_ROWS)
+		if count > 0 and nCols > 0 and kInner > 0 then
+			local outputElements = productWithinLimit(count, nCols, remaining)
+			if outputElements == nil then
+				return false, 0
+			end
+			local multiplyAdds = productWithinLimit(outputElements, kInner, remaining)
+			if multiplyAdds == nil then
+				return false, 0
+			end
+			work = multiplyAdds
+			if not arrayRangeFits(memory, src, count * kInner, 4)
+				or not arrayRangeFits(memory, matrix, kInner * nCols, 4)
+				or not arrayRangeFits(memory, dst, outputElements, 4)
+				or (aux ~= 0 and not arrayRangeFits(memory, aux, nCols, 4))
+			then
+				return false, 0
+			end
+		end
 		self:gemm(src, matrix, dst, aux, count, nCols, kInner, relu, tileStart, tileRows)
 	elseif op == Npu.OP.NORM_BATCH then
+		if count > math.floor(remaining / 3)
+			or not arrayRangeFits(memory, src, count, 12)
+			or not arrayRangeFits(memory, dst, count, 12)
+		then
+			return false, 0
+		end
+		work = count * 3
 		self:normBatch(src, dst, count)
 	elseif op == Npu.OP.DEQUANT_INT8 then
+		if count > remaining
+			or not arrayRangeFits(memory, src, count, 1)
+			or not arrayRangeFits(memory, dst, count, 4)
+		then
+			return false, 0
+		end
+		work = count
 		self:dequantInt8(src, dst, count, matrix, aux)
 	elseif op == Npu.OP.DMA_COPY then
-		if count > 0 and src + count <= self.ramSize and dst + count <= self.ramSize then
+		if count > remaining
+			or not memory:containsRange(src, count)
+			or not memory:containsRange(dst, count)
+		then
+			return false, 0
+		end
+		work = count
+		if count > 0 then
 			buffer.copy(self.ram, dst, self.ram, src, count)
 			if dst < memory.codeHigh and dst + count > memory.codeLow then
 				memory:notifyCodeWrite(dst, count)
@@ -393,29 +483,53 @@ function Npu.execute(self: Class, command: number)
 			self.stats.dmaBytes += count
 		end
 	elseif op == Npu.OP.DMA_FILL then
-		if count > 0 and dst + count <= self.ramSize then
+		if count > remaining or not memory:containsRange(dst, count) then
+			return false, 0
+		end
+		work = count
+		if count > 0 then
 			buffer.fill(self.ram, dst, src % 256, count)
 			if dst < memory.codeHigh and dst + count > memory.codeLow then
 				memory:notifyCodeWrite(dst, count)
 			end
 			self.stats.dmaBytes += count
 		end
+	else
+		return false, 0
 	end
+
+	return true, work
 end
 
---- Drain every queued NPU/DMA command.
+--- Drain the queue, validating guest ranges and bounding total accelerator work.
 function Npu.pump(self: Class): number
 	if not self.pending then
 		return 0
 	end
 	self.pending = false
+	if self.queueCount < 0 or self.queueCount % 1 ~= 0 or self.queueCount > Npu.MAX_QUEUE_COMMANDS
+		or (self.queueCount > 0 and not self.memory:containsRange(self.queueBase, self.queueCount * Npu.COMMAND_SIZE))
+	then
+		self.queueFaults += 1
+		self.status = 3
+		return 0
+	end
+
 	local executed = 0
+	local remainingWork = Npu.MAX_QUEUE_WORK
+	local failed = false
 	for index = 0, self.queueCount - 1 do
-		self:execute(self.queueBase + index * Npu.COMMAND_SIZE)
+		local accepted, work = self:execute(self.queueBase + index * Npu.COMMAND_SIZE, remainingWork)
 		executed += 1
+		if not accepted then
+			self.queueFaults += 1
+			failed = true
+			break
+		end
+		remainingWork -= work
 	end
 	self.commandsRun += executed
-	self.status = 2
+	self.status = if failed then 3 else 2
 	return executed
 end
 
