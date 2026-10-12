@@ -323,7 +323,7 @@ function Gpu:pump(): number
 		return 0
 	end
 
-	self.raster.workRemaining = Raster.MAX_WORK
+	self.raster.workRemaining = Raster.budgetFor(self.width, self.height)
 	self.raster.workLimitHit = false
 	local executed = 0
 	local failed = false

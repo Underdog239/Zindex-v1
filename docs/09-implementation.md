@@ -32,7 +32,7 @@ python3 Tests/bundle.py && luau --codegen Tests/combined.luau
 
 `Tests/bundle.py` rewrites `require(script.Parent.X)` into a module table so the
 library runs unchanged outside Roblox, then appends `Tests/suite.luau`. The
-suite drives the real core through the real assembler; nothing is mocked. **212
+suite drives the real core through the real assembler; nothing is mocked. **244
 checks, all passing** under both the Luau interpreter and `--codegen` native
 code generation, and every module in `src/Zindex/*.luau` compiles cleanly with
 `luau-compile --codegen`.
@@ -71,6 +71,16 @@ Covered:
 - **Assembler conveniences**: `.equ` constants, `.macro`/`.endm` expansion with
   local labels, scientific-notation floats (`1e-3`, `-2.5e-2`, `1.5e+2`), image
   round trip, and illegal opcode handling.
+- **Bounded-but-tileable accelerator work**: a `GEMM` larger than the 262,144-unit
+  queue budget is accepted as bounded tile jobs (`tileRow0`/`tileRows`), each charged
+  only for the rows it visits and verified to land at the right output offset, while
+  the untiled product is still rejected.
+- **Viewport-scaled raster budget**: `clear` and a queued `CLEAR`+`PRESENT` complete on
+  a 1024x768 target, and a tiled draw above 1,000,000 pixels composites every tile,
+  with the fixed-ceiling rejection still pinned by a test that lowers the budget knobs.
+- **Save-state fidelity for the viewport**: a scale below the adaptive floor survives
+  `snapshot`/`restore` verbatim, and the GPU, raster and framebuffer descriptor all
+  report the same size afterwards.
 
 `Examples/demo.luau` fills a framebuffer from machine code and asks the host to
 present. `Examples/gpu.luau` uploads a mesh and a matrix, then has guest code
@@ -112,3 +122,25 @@ Stated plainly (see doc 04 and doc 08):
   `self.cycles = cycles` was synced on the MMIO slow path.
 
 All five were found by running the suite and the examples, not by reading code.
+
+## 5. Findings fixed in the second hardening pass
+
+Three defects reported against the first hardening pass, each now covered by a
+regression test that fails on the previous code (18 failing checks before the fix):
+
+1. **`GEMM` charged the whole matrix** against the 262,144-unit queue budget even when
+   `tileRow0`/`tileRows` asked for a few rows, so every bounded tile job of a large
+   matrix was rejected. The charge now follows the rows the tile visits, the tile span
+   is validated as an integer range inside the matrix, and operand bounds still cover
+   the whole command.
+2. **`restore` clamped the saved resolution scale** by routing it through
+   `setResolutionScale`, which also resizes the framebuffer: a 64x64 chip saved at
+   scale 0.25 came back with a 16x16 raster but a 32x32 framebuffer descriptor, so the
+   host uploaded a size the raster never drew. Restore now writes the saved scale and
+   dimensions verbatim to the GPU, the raster and the framebuffer descriptor.
+3. **`Raster:clear` charged the whole-plane depth clear per pixel and the per-pump
+   budget was a fixed 1,000,000 units**, so `CLEAR` failed on every target above
+   500,000 pixels (1024x768 charges about 1.57M) and tiled draws failed above
+   1,000,000 pixels. The depth clear is now charged per row and the per-pump budget is
+   `max(1,000,000, 8 x viewport pixels)`, which stays bounded because the viewport is
+   host configuration.

@@ -28,9 +28,24 @@ Raster.FLAT = 0
 Raster.GOURAUD = 1
 Raster.TEXTURED = 2
 Raster.MAX_WORK = 1000000
+-- Work is measured in screen-space candidate pixels, submitted triangles and
+-- tiled viewport copying, so a frame's real cost scales with the viewport. The
+-- per-pump budget therefore has a fixed floor plus a per-pixel allowance: a
+-- fixed 1,000,000-unit ceiling would reject every CLEAR and every tiled draw on
+-- any viewport above 500,000 pixels.
+Raster.WORK_PER_PIXEL = 8
 Raster.MAX_TRIANGLES = 8192
 Raster.MAX_VERTICES = 1000000
 Raster.MAX_TEXTURE_PIXELS = 1048576
+
+--- Per-pump work budget for a viewport, in work units.
+function Raster.budgetFor(width: number, height: number): number
+	local pixels = width * height
+	if pixels ~= pixels or pixels <= 0 then
+		return Raster.MAX_WORK
+	end
+	return math.max(Raster.MAX_WORK, Raster.WORK_PER_PIXEL * pixels)
+end
 
 local function bufferRangeFits(target: buffer, address: number, size: number): boolean
 	if address ~= address or size ~= size or address % 1 ~= 0 or size % 1 ~= 0 then
@@ -140,8 +155,10 @@ function Raster:clear(word: number): boolean
 	local scW: number = self.scissorW
 	local scH: number = self.scissorH
 	local planeBytes = height * stride
-	local work = scW * scH + width * height
-	local remaining = self.workRemaining or Raster.MAX_WORK
+	-- The colour fill is one word per pixel; the depth clear is a bulk
+	-- `buffer.fill` per row, so it is charged per row rather than per pixel.
+	local work = scW * scH + height
+	local remaining = self.workRemaining or Raster.budgetFor(width, height)
 	if not bufferRangeFits(colour, colourBase, planeBytes)
 		or not bufferRangeFits(depth, depthBase, planeBytes)
 		or work > remaining
@@ -304,7 +321,7 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 
 	local triangles: number = math.floor(indexCount / 3)
 	local rasterized: number, fragments: number, written: number = 0, 0, 0
-	local workRemaining = self.workRemaining or Raster.MAX_WORK
+	local workRemaining = self.workRemaining or Raster.budgetFor(width, height)
 	if workRemaining < 0 or workRemaining % 1 ~= 0 then
 		return 0, false
 	end
@@ -615,7 +632,7 @@ function Raster:drawMeshTiled(
 
 	local ownsBudget = self.workRemaining == nil
 	if ownsBudget then
-		self.workRemaining = Raster.MAX_WORK
+		self.workRemaining = Raster.budgetFor(width, height)
 	end
 	self.workLimitHit = false
 	local copyWork = width * height

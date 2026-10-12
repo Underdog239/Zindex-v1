@@ -729,10 +729,17 @@ function Zindex:restore(state)
 		gpu.targetFps = saved.targetFps
 		gpu.baseWidth = saved.baseWidth
 		gpu.baseHeight = saved.baseHeight
-		gpu:setResolutionScale(saved.scale)
+		-- Restore the saved scale verbatim. Routing it through setResolutionScale
+		-- would clamp it to the chip's current min/max and resize the framebuffer,
+		-- so the host would upload a different size than the raster drew.
+		gpu.scale = saved.scale
 		gpu.width = saved.width
 		gpu.height = saved.height
 		gpu.raster:resize(saved.width, saved.height)
+		if gpu.framebuffer ~= nil then
+			gpu.framebuffer.width = saved.width
+			gpu.framebuffer.height = saved.height
+		end
 		gpu.queueBase = saved.queueBase
 		gpu.queueCount = saved.queueCount
 		gpu.pending = saved.pending

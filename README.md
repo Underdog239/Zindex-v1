@@ -79,18 +79,19 @@ python3 Tests/bundle.py && luau --codegen Tests/combined.luau
 ```
 
 The bundler rewrites `require(script.Parent.X)` into a module table so the library runs unchanged
-outside Roblox. The suite drives the real core through the real assembler - **212 checks** covering
+outside Roblox. The suite drives the real core through the real assembler - **244 checks** covering
 arithmetic wrapping, 32-bit multiply exactness, shifts, signed and unsigned comparison, bounded
 memory access, control flow, calls, Tier 0/1/2 cycle-exact and byte-exact equivalence,
 self-modifying code block invalidation, the full vector unit (`VFMA`, `VDP3`, `VRED`, `VSCL`,
 `VMIN`, `VMAX`), the Z-NPU command queue (`GEMM`, `DOT_BATCH`, `NORM_BATCH`, `DEQUANT_INT8`,
-`DMA_COPY`) and malformed queue rejection, 4-core execution with shared memory atomics and `SYNC`
-barriers, timer interrupts and constant-time recurring timer catch-up, bounded audio ring-buffer
-pulls, `.equ` and `.macro`, validated program images and empty data sections, illegal opcodes,
-single-/multi-core save-state replay across devices, accelerator queues, shared memory, registers,
-and private RAM, and on the graphics side coverage, depth, interpolation, culling, matrix
-convention, tiled rendering + `buffer.copy` compositing, adaptive resolution, and safe
-command-queue rejection. Invalid RAM/MMIO accesses are fault-counted and can be observed through
+`DMA_COPY`), bounded tiled `GEMM` jobs and malformed queue rejection, 4-core execution with shared
+memory atomics and `SYNC` barriers, timer interrupts and constant-time recurring timer catch-up,
+bounded audio ring-buffer pulls, `.equ` and `.macro`, validated program images and empty data
+sections, illegal opcodes, single-/multi-core save-state replay across devices, accelerator queues,
+shared memory, registers, private RAM and the framebuffer descriptor, and on the graphics side
+coverage, depth, interpolation, culling, matrix convention, tiled rendering + `buffer.copy`
+compositing, adaptive resolution, viewport-scaled raster budgeting, and safe command-queue
+rejection. Invalid RAM/MMIO accesses are fault-counted and can be observed through
 a dedicated `onMemoryTrap` callback, separate from ECALL `onTrap`.
 
 ## Documentation
