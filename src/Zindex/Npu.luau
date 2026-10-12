@@ -431,7 +431,15 @@ function Npu.execute(self: Class, command: number, workBudget: number?): (boolea
 		local tileStart = memory:read32(command + F_TILE_START)
 		local tileRows = memory:read32(command + F_TILE_ROWS)
 		if count > 0 and nCols > 0 and kInner > 0 then
-			local outputElements = productWithinLimit(count, nCols, remaining)
+			-- The budget is charged for the rows this command actually visits, so a
+			-- guest can split a large matrix into bounded tile jobs. Validating the
+			-- operands is a separate concern and still covers the whole command.
+			if tileStart % 1 ~= 0 or tileRows % 1 ~= 0 or tileStart < 0 or tileStart > count or tileRows < 0 then
+				return false, 0
+			end
+			local rowEnd = if tileRows > 0 then math.min(count, tileStart + tileRows) else count
+			local rows = rowEnd - tileStart
+			local outputElements = productWithinLimit(rows, nCols, remaining)
 			if outputElements == nil then
 				return false, 0
 			end
@@ -442,7 +450,7 @@ function Npu.execute(self: Class, command: number, workBudget: number?): (boolea
 			work = multiplyAdds
 			if not arrayRangeFits(memory, src, count * kInner, 4)
 				or not arrayRangeFits(memory, matrix, kInner * nCols, 4)
-				or not arrayRangeFits(memory, dst, outputElements, 4)
+				or not arrayRangeFits(memory, dst, count * nCols, 4)
 				or (aux ~= 0 and not arrayRangeFits(memory, aux, nCols, 4))
 			then
 				return false, 0

@@ -71,10 +71,13 @@ Commands, 48 bytes each (see doc 05 for the field list):
 | `PRESENT` (4) | request this frame's single upload |
 | `SET_COLOUR` (5) | `src` becomes the colour plane address |
 
-Guest queues are limited to 256 commands and the complete queue must fit in RAM. Each pump has
-a 1,000,000-unit raster budget (screen-space candidate pixels, submitted triangle
-work, and tiled viewport copying), scissor rectangles are clipped to the viewport,
-and each mesh is limited to 8,192 triangles.
+Guest queues are limited to 256 commands and the complete queue must fit in RAM. Each pump has a
+raster budget of `max(1,000,000, 8 x viewport pixels)` work units: screen-space candidate pixels,
+submitted triangle work, and tiled viewport copying. A `CLEAR` charges one unit per colour pixel
+plus one per row of bulk depth clear. The budget scales with the viewport because the work does - a
+fixed ceiling rejected every `CLEAR` above 500,000 pixels and every tiled draw above 1,000,000 -
+and it stays bounded because the viewport is host configuration, never guest input. Scissor
+rectangles are clipped to the viewport, and each mesh is limited to 8,192 triangles.
 Mesh, matrix, texture, colour, depth, index, and attribute ranges are checked before raw buffer
 access. Invalid descriptors or exhausted work set status 3 and stop draining the queue.
 

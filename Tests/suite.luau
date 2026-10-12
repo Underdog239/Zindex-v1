@@ -306,6 +306,37 @@ do
 	eq('save state restores NPU statistics', chip.npu.stats.vectorOps, 13)
 end
 do
+	-- A viewport and its framebuffer descriptor have to come back from a save
+	-- state exactly as saved. Routing the saved scale through
+	-- `setResolutionScale` clamps it (0.25 here, against minScale 0.5) and
+	-- resizes the framebuffer, so the host would upload a size the raster never
+	-- drew while the raster kept the saved one.
+	local chip = Zindex.new({
+		ramSize = 0x10000,
+		width = 64,
+		height = 64,
+		back = 0x4000,
+		depth = 0x8000,
+		resolutionScale = 0.25,
+		minScale = 0.5,
+		maxScale = 1.0,
+	})
+	chip:assemble[[halt]]
+	eq('scale below the adaptive floor still attaches', chip.gpu.width, 16)
+	local state = chip:snapshot()
+	chip.gpu:setResolutionScale(1.0)
+	eq('scale change resizes the framebuffer before restore', chip.devices.framebuffer.width, 64)
+
+	chip:restore(state)
+	eq('save state restores the GPU scale verbatim', chip.gpu.scale, 0.25)
+	eq('save state restores the GPU viewport width', chip.gpu.width, 16)
+	eq('save state restores the GPU viewport height', chip.gpu.height, 16)
+	eq('save state restores the raster viewport', chip.gpu.raster.width + chip.gpu.raster.height, 32)
+	eq('save state restores the framebuffer width', chip.devices.framebuffer.width, 16)
+	eq('save state restores the framebuffer height', chip.devices.framebuffer.height, 16)
+	eq('save state restores the scale register', chip.gpu:readRegister(0x3C), chip.gpu:floatBits(0.25))
+end
+do
 	local cluster = Zindex.new({ ramSize = 0x10000, coreCount = 2, sharedWords = 16 })
 	cluster:assemble[[halt]]
 	cluster:setReg(1, 11, 1)
@@ -787,11 +818,14 @@ do
 	chip.gpu.raster:setScissor(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
 	eq('guest scissor is clipped to viewport', chip.gpu.raster.scissorW + chip.gpu.raster.scissorH, 0)
 	local oldBudget = Zindex.Raster.MAX_WORK
-	Zindex.Raster.MAX_WORK = 1
+	local oldPerPixel = Zindex.Raster.WORK_PER_PIXEL
+	Zindex.Raster.MAX_WORK = 0
+	Zindex.Raster.WORK_PER_PIXEL = 0
 	chip.memory:write32(page + 4, 1)
 	chip.memory:write32(page + 8, 1)
 	chip:pumpGpu()
 	Zindex.Raster.MAX_WORK = oldBudget
+	Zindex.Raster.WORK_PER_PIXEL = oldPerPixel
 	eq('tiled GPU work is bounded per pump', chip.gpu.status, 3)
 end
 
@@ -1042,6 +1076,67 @@ do
 end
 
 do
+	-- GEMM tile charging. A 512x32x32 product is 524,288 multiply-adds and cannot
+	-- fit one command's share of the 262,144-unit queue budget, so the whole
+	-- matrix has to be split into bounded tile jobs. Only the rows a tile visits
+	-- may be charged, and the tile has to land its rows at the right output
+	-- offset. The untiled shape must still be rejected.
+	local M, N, K = 512, 32, 32
+	local aAddr, bAddr, cAddr = 0x1000, 0x11000, 0x12000
+	--- C[r][col] for A[r][k] = r + k and B[k][col] = 1: K * r + K * (K - 1) / 2.
+	local function rowDot(r: number): number
+		return K * r + K * (K - 1) / 2
+	end
+	local chip = Zindex.new({ ramSize = 0x40000 })
+	local ram = chip:ram()
+	for r = 0, M - 1 do
+		for k = 0, K - 1 do
+			buffer.writef32(ram, aAddr + (r * K + k) * 4, r + k)
+		end
+	end
+	for k = 0, K - 1 do
+		for col = 0, N - 1 do
+			buffer.writef32(ram, bAddr + (k * N + col) * 4, 1.0)
+		end
+	end
+	local function queueGemm(tileStart, tileRows)
+		local mem = chip.memory
+		mem:write32(0x8000, Zindex.Npu.OP.GEMM)
+		mem:write32(0x8004, aAddr)
+		mem:write32(0x8008, cAddr)
+		mem:write32(0x800C, M)
+		mem:write32(0x8010, bAddr)
+		mem:write32(0x8014, 0)
+		mem:write32(0x8018, 0)
+		mem:write32(0x801C, 0)
+		mem:write32(0x8020, N)
+		mem:write32(0x8024, K)
+		mem:write32(0x8028, tileStart)
+		mem:write32(0x802C, tileRows)
+		local page = Zindex.Npu.PAGE
+		mem:write32(page, 0x8000)
+		mem:write32(page + 4, 1)
+		mem:write32(page + 8, 1)
+		return chip:pumpNpu()
+	end
+
+	chip.npu:resetStats()
+	eq('one-row GEMM tile is accepted', queueGemm(0, 1), 1)
+	eq('one-row GEMM tile reports done', chip.npu.status, 2)
+	eq('one-row GEMM tile wrote one output row', chip.npu.stats.elements, N)
+	eq('one-row GEMM tile fills row 0', buffer.readf32(ram, cAddr), rowDot(0))
+
+	chip.npu:resetStats()
+	eq('later GEMM tile is accepted', queueGemm(400, 112), 1)
+	eq('later GEMM tile reports done', chip.npu.status, 2)
+	eq('later GEMM tile wrote 112 rows', chip.npu.stats.elements, 112 * N)
+	eq('GEMM tile output lands at the tile offset', buffer.readf32(ram, cAddr + 400 * N * 4), rowDot(400))
+
+	eq('untiled GEMM over the queue budget is still rejected', queueGemm(0, 0), 1)
+	eq('untiled GEMM over the queue budget reports the work limit', chip.npu.status, 3)
+end
+
+do
 	local chip = newChip(0x10000)
 	local page = Zindex.Npu.PAGE
 	chip.memory:write32(page, 0x8000)
@@ -1144,6 +1239,68 @@ do
 	eq('framebuffer height scaled down', adaptiveChip.devices.framebuffer.height, 68)
 	local grownScale = adaptiveChip.gpu:adapt(0.002) -- 2 ms < 16.6 ms * 0.7
 	check('adaptive resolution grows on fast frame', grownScale > shrunkScale, grownScale)
+end
+
+do
+	-- The per-pump raster budget scales with the viewport. A fixed 1,000,000-unit
+	-- ceiling made CLEAR fail on any target above 500,000 pixels (the colour fill
+	-- and a whole-plane depth clear were both charged per pixel) and made tiled
+	-- draws fail above 1,000,000 pixels (whole-plane tile copying).
+	eq('raster budget floors at the fixed maximum', Zindex.Raster.budgetFor(16, 16), Zindex.Raster.MAX_WORK)
+	eq(
+		'raster budget scales with the viewport',
+		Zindex.Raster.budgetFor(1024, 768),
+		Zindex.Raster.WORK_PER_PIXEL * 1024 * 768
+	)
+
+	local chip = Zindex.new({ ramSize = 0x800000, width = 1024, height = 768, back = 0x100000, depth = 0x400000 })
+	local lastPixel = 0x100000 + (768 * 1024 - 1) * 4
+	check('clear runs on a 1024x768 viewport', chip.gpu.raster:clear(0xFF102030))
+	eq('large clear fills the last pixel', buffer.readu32(chip:ram(), lastPixel), 0xFF102030)
+	eq('large clear resets depth', buffer.readf32(chip:ram(), 0x400000), 0)
+
+	local mem = chip.memory
+	mem:write32(0x8000, Zindex.Gpu.OP.CLEAR)
+	mem:write32(0x8004, 0xFF203040)
+	mem:write32(0x8000 + 48, Zindex.Gpu.OP.PRESENT)
+	mem:write32(0x8000 + 48 + 4, 0)
+	local page = Zindex.Gpu.PAGE
+	mem:write32(page, 0x8000)
+	mem:write32(page + 4, 2)
+	mem:write32(page + 8, 1)
+	eq('large viewport queue drains CLEAR and PRESENT', chip:pumpGpu(), 2)
+	eq('large viewport queue reports done', chip.gpu.status, 2)
+	check('large viewport frame asks for its one present', chip.devices.framebuffer.presentRequested)
+	eq('large viewport pixel after the queued clear', buffer.readu32(chip:ram(), lastPixel), 0xFF203040)
+end
+
+do
+	-- Tiled drawing on a viewport above 1,000,000 pixels: rejected under the old
+	-- fixed ceiling, accepted once the budget follows the viewport.
+	local chip = Zindex.new({ ramSize = 0x1000000, width = 1024, height = 1024, back = 0x100000, depth = 0x500000 })
+	chip.gpu.tileCount = 4
+	chip.gpu.queueBase = 0x8000
+	chip.gpu.queueCount = 1
+	chip.memory:write32(0x8000, Zindex.Gpu.OP.DRAW_MESH)
+	chip.memory:write32(0x8004, 0x9000)
+	chip.memory:write32(0x8008, 0)
+	chip.memory:write32(0x8010, 0xA000)
+
+	local savedWork = Zindex.Raster.MAX_WORK
+	local savedPerPixel = Zindex.Raster.WORK_PER_PIXEL
+	Zindex.Raster.MAX_WORK = 1000000
+	Zindex.Raster.WORK_PER_PIXEL = 0
+	chip.gpu.pending = true
+	chip:pumpGpu()
+	eq('tiled draw is work-limited under a fixed ceiling', chip.gpu.status, 3)
+	eq('work-limited tiled draw composites nothing', chip.gpu.raster.stats.tilesComposited, 0)
+
+	Zindex.Raster.MAX_WORK = savedWork
+	Zindex.Raster.WORK_PER_PIXEL = savedPerPixel
+	chip.gpu.pending = true
+	chip:pumpGpu()
+	eq('tiled draw above 1M pixels is accepted', chip.gpu.status, 2)
+	eq('tiled draw above 1M pixels composites every tile', chip.gpu.raster.stats.tilesComposited, 4)
 end
 
 --=====================================================================
