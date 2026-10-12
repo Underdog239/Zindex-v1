@@ -44,3 +44,15 @@ and any guest is compiled *to* it rather than translated *through* it.
 
 That inversion is the entire point, and it is also the honest limit: Zindex does not make old
 hardware faster. It makes a new machine possible.
+
+## 5. Heterogeneous non-claims
+
+Adding a raster unit and a tensor unit does not change the walls. Specifically:
+
+- The GPU unit is a **software rasteriser**. It is not GPU hardware and it never will be; every
+  pixel is host work (doc 06 section 5).
+- The NPU unit is **3-lane float32 vector maths** fanned across Actors. It is not matrix hardware,
+  and there is no INT8 tensor core (doc 07 sections 2 and 4).
+- Adding units does not add memory. All units draw from the same fixed client budget.
+- More units does not mean more throughput than the host can supply. Throughput is bounded by
+  interpreted instruction rate times busy cores (doc 08 section 2).
