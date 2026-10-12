@@ -1,13 +1,69 @@
 # Zindex-32 (Z32)
 
-A **virtual chip architecture** designed for Luau - an ISA built *for* Roblox's substrate instead
-of borrowed from someone else's silicon, plus the heterogeneous SoC that surrounds it: Z-CPU
-cores, an **Avalon R1** software rasteriser as the GPU, and a **Z-NPU** vector/tensor unit.
+A **virtual chip architecture** designed for Luau - an ISA built *for* Roblox's substrate
+instead of borrowed from someone else's silicon - plus a working implementation of it.
 
-This repository currently contains **the architecture specification only**.
-No execution engine, no emulator, no guest software.
+You can use the chip today. It runs in Roblox and it runs in the Luau CLI.
 
-## Documents
+## Quick start
+
+```lua
+local Zindex = require(game.ReplicatedStorage.Zindex)
+
+local chip = Zindex.new({ ramSize = 0x10000 })
+chip:assemble[[
+	li r1, 0
+	li r2, 1
+	li r3, 10
+loop:
+	add r1, r1, r2
+	addi r2, r2, 1
+	bgeu r3, r2, loop
+	halt
+]]
+chip:run(10000)
+print(chip:reg(1))   --> 55
+```
+
+Draw to a framebuffer and let the host present it once per frame:
+
+```lua
+local chip = Zindex.new({ ramSize = 0x10000, width = 320, height = 240, back = 0x4000 })
+chip:assemble(program)
+
+local view = Zindex.RobloxView.new(chip, { parent = script.Parent })
+view:start(50000)   -- cycles per frame
+```
+
+`Examples/demo.luau` is a complete program: it fills 4096 pixels from machine code, asks the
+host to present, prints through a host call, and exits.
+
+## Layout
+
+```
+src/Zindex/Opcodes.luau     the instruction set as data
+src/Zindex/Memory.luau      address space: RAM buffer, device window, trap page
+src/Zindex/Devices.luau     DEV, TIMER, INPUT, AUDIO, IPC, FB
+src/Zindex/Core.luau        a CPU core: decode, execute, cycle accounting, disassembler
+src/Zindex/Assembler.luau   two-pass assembler: labels, expressions, directives, listing
+src/Zindex/Image.luau       program image pack and unpack
+src/Zindex/init.luau        public API: build, load, run, snapshot, restore, host calls
+src/Zindex/RobloxView.luau  the only file that touches a Roblox API
+```
+
+## Running the tests
+
+```
+python3 Tests/bundle.py && luau Tests/combined.luau
+```
+
+The bundler rewrites `require(script.Parent.X)` into a module table so the library runs unchanged
+outside Roblox. The suite drives the real core through the real assembler - 64 checks covering
+arithmetic wrapping, 32-bit multiply exactness, shifts, signed and unsigned comparison, memory
+access with sign extension, control flow, calls, the vector unit, devices, host calls, the
+assembler, images, illegal opcodes, and byte-exact save state replay.
+
+## Documentation
 
 | Doc | Contents |
 | --- | --- |
@@ -20,13 +76,16 @@ No execution engine, no emulator, no guest software.
 | [`docs/06-gpu-avalon.md`](docs/06-gpu-avalon.md) | the Avalon R1 raster unit, its contract and its hard limits |
 | [`docs/07-npu.md`](docs/07-npu.md) | the Z-NPU vector/tensor unit, and its 3-lane ceiling |
 | [`docs/08-peak.md`](docs/08-peak.md) | what the real ceiling is, and where the remaining risk is |
+| [`docs/09-implementation.md`](docs/09-implementation.md) | what is built, what is tested, and what is not there yet |
 
-## One-paragraph summary
+## Why it is shaped this way
 
 Roblox cannot give you more RAM, more storage, a GPU, or a client-side JIT. Those walls are
-permanent. Zindex is designed around them instead of against them: 32-bit words because Luau
-numbers are doubles, byte-aligned instruction encoding because `bit32` is a library of function
-calls, machine state in `buffer`s rather than tables, a float unit that literally *is* Luau's
-natively accelerated `vector` maths, a cycle-budget scheduler that cannot trip the watchdog, and
-deterministic execution so save states and replay are exact. The result is a machine that wastes
-none of the headroom that actually exists.
+permanent, so Zindex is designed around them: 32-bit words because Luau numbers are doubles,
+byte-aligned instruction encoding because `bit32` is a library of function calls and a bit-packed
+format would tax every instruction executed, machine state in `buffer`s rather than tables so a
+register costs 4 bytes instead of 20-30, a float unit that literally *is* Luau's natively
+accelerated `vector` maths, a cycle-budget scheduler that cannot trip the watchdog, and
+deterministic execution so save states and replay are exact.
+
+Start with `docs/09-implementation.md` for the honest state of things.

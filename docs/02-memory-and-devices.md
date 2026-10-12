@@ -51,8 +51,11 @@ The FB page holds a descriptor, not pixels:
 | +0x08 | format (0 = RGBA8, 1 = RGB332, 2 = indexed8 + palette) |
 | +0x0C | back buffer address in RAM |
 | +0x10 | front buffer address (read-only to the guest) |
-| +0x14 | dirty rect x, y, w, h |
-| +0x18 | present flag (write 1 to request a present) |
+| +0x14 | dirty rect x |
+| +0x18 | dirty rect y |
+| +0x1C | dirty rect width |
+| +0x20 | dirty rect height |
+| +0x24 | present flag (write 1 to request a present) |
 
 The guest draws into the back buffer. Once per host frame the host copies the back buffer into a
 displayed `EditableImage` and swaps. This is designed around the hard rule that only one
@@ -98,7 +101,8 @@ A Zindex program image is one buffer:
 | +0x08 | RAM size |
 | +0x0C | device profile id |
 | +0x10 | code size |
-| +0x14 | code bytes |
+| +0x14 | code load address |
+| +0x18 | code bytes |
 | ... | initial data bytes |
 
 No claim is made about where images are stored. Persistence is a host concern, and the host's

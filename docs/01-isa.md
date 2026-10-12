@@ -117,11 +117,15 @@ Word (LW/SW) addresses must be 4-byte aligned. Byte and half accesses may be una
 
 - Arithmetic is 32-bit two's complement. Registers hold unsigned values 0..2^32-1; results are
   reduced modulo 2^32. Signed comparison converts by subtracting 2^32 when the top bit is set.
-- DIV is floor division; REM is modulo. Division by zero yields 0. Defined, no trap, so the hot
-  path stays branch-free and deterministic.
+- DIV and REM treat their operands as **unsigned** 32-bit values. Signed division is a short
+  sign-fixup sequence, which is cheaper than a second opcode. Division by zero yields 0:
+  defined, no trap, so the hot path stays branch-free and deterministic.
 - Shifts of 32 or more yield 0 (SAR sign-fills). Shifts are the documented slow path; compilers
   should strength-reduce constant shifts to MUL/DIV by powers of two.
 - LBU/LHU zero-extend; LB/LH sign-extend to 32 bits.
+- Load and store displacements are **signed** 8-bit, so `[FP-4]` and friends work.
+- `ADDI` takes a signed immediate; `ANDI`/`ORI`/`XORI`/`MULI` and shift counts take an
+  unsigned one.
 - There are no condition codes. Compare-and-branch is one instruction, which removes an entire
   class of dependency stalls and makes the ISA trivially serializable.
 

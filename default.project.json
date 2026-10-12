@@ -1,0 +1,12 @@
+{
+  "name": "Zindex",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Zindex": {
+        "$path": "src/Zindex"
+      }
+    }
+  }
+}
