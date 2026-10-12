@@ -53,7 +53,10 @@ A command is 48 bytes, 12 words:
 | +0x2C | rectH | |
 
 The CPU writes commands into RAM and kicks the queue by writing the GPU kick register in the MMIO
-window. The host bridge drains the queue each frame and dispatches work to Actors.
+window. Queues are limited to 256 commands and must fit wholly in RAM. The host bridge validates
+the descriptors before reading them; oversized queues or invalid work set status 3 (rejected).
+GPU raster work is also capped per pump so a guest cannot turn a frame callback into unbounded
+host work.
 
 ## 4. Frame model
 

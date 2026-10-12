@@ -34,6 +34,7 @@ Gpu.__index = Gpu
 
 Gpu.PAGE = 0x0F006000
 Gpu.COMMAND_SIZE = 48
+Gpu.MAX_QUEUE_COMMANDS = 256
 
 Gpu.OP = {
 	NOP = 0,
@@ -83,14 +84,16 @@ function Gpu.attach(memory, options)
 	self.queueCount = 0
 	self.pending = false
 	self.status = 0
+	self.queueFaults = 0
 	self.near = 0.0001
 	self.commandsRun = 0
-	self.tileCount = options.tileCount or 1
+	self.tileCount = 1
 	self.scissorX = 0
 	self.scissorY = 0
 	self.scissorW = self.width
 	self.scissorH = self.height
 	self.scratch = buffer.create(4)
+	self:setTileCount(options.tileCount or 1)
 
 	if self.framebuffer ~= nil then
 		self.framebuffer.width = self.width
@@ -127,11 +130,17 @@ function Gpu:setNearBits(bits: number)
 end
 
 function Gpu:setTileCount(tiles: number)
-	self.tileCount = math.max(1, math.floor(tiles))
+	if tiles ~= tiles or tiles == math.huge or tiles == -math.huge then
+		return
+	end
+	self.tileCount = math.clamp(math.floor(tiles), 1, math.max(1, math.min(64, self.height)))
 end
 
 --- Change the internal rendering resolution scale (Avalon R1 adaptive scale).
 function Gpu:setResolutionScale(scale: number): (number, number)
+	if scale ~= scale or scale == math.huge or scale == -math.huge then
+		return self.width, self.height
+	end
 	local clamped = math.clamp(scale, self.minScale, self.maxScale)
 	self.scale = clamped
 	local w = math.max(4, round(self.baseWidth * clamped))
@@ -249,22 +258,27 @@ function Gpu:applyScissor(command: number)
 	end
 end
 
-function Gpu:execute(command: number)
+function Gpu:execute(command: number): boolean
 	local memory = self.memory
+	if not memory:containsRange(command, Gpu.COMMAND_SIZE) then
+		return false
+	end
 	local op = memory:read32(command + F_OP)
 	if op == Gpu.OP.NOP then
-		return
+		return true
 	elseif op == Gpu.OP.CLEAR then
 		self.raster.colourBase = self.colourAddress
 		self.raster.depthBase = self.depthAddress
 		self:applyScissor(command)
-		self.raster:clear(memory:read32(command + F_SRC))
+		return self.raster:clear(memory:read32(command + F_SRC))
 	elseif op == Gpu.OP.SET_COLOUR then
 		self.colourAddress = memory:read32(command + F_SRC)
 		self.raster.colourBase = self.colourAddress
+		return true
 	elseif op == Gpu.OP.SET_DEPTH then
 		self.depthAddress = memory:read32(command + F_SRC)
 		self.raster.depthBase = self.depthAddress
+		return true
 	elseif op == Gpu.OP.DRAW_MESH then
 		local destination = memory:read32(command + F_DST)
 		if destination == 0 then
@@ -273,46 +287,57 @@ function Gpu:execute(command: number)
 		self.raster.colourBase = destination
 		self.raster.depthBase = self.depthAddress
 		self:applyScissor(command)
+		local mesh = memory:read32(command + F_SRC)
+		local matrix = memory:read32(command + F_MATRIX)
+		local shading = memory:read32(command + F_SHADING)
+		local texture = memory:read32(command + F_TEXTURE)
+		local cull = bit32.band(memory:read32(command + F_FLAGS), 1) ~= 0
+		local _, accepted
 		if self.tileCount > 1 then
-			self.raster:drawMeshTiled(
-				self.tileCount,
-				memory:read32(command + F_SRC),
-				memory:read32(command + F_MATRIX),
-				memory:read32(command + F_SHADING),
-				memory:read32(command + F_TEXTURE),
-				bit32.band(memory:read32(command + F_FLAGS), 1) ~= 0,
-				self.near
-			)
+			_, accepted = self.raster:drawMeshTiled(self.tileCount, mesh, matrix, shading, texture, cull, self.near)
 		else
-			self.raster:drawMesh(
-				memory:read32(command + F_SRC),
-				memory:read32(command + F_MATRIX),
-				memory:read32(command + F_SHADING),
-				memory:read32(command + F_TEXTURE),
-				bit32.band(memory:read32(command + F_FLAGS), 1) ~= 0,
-				self.near
-			)
+			_, accepted = self.raster:drawMesh(mesh, matrix, shading, texture, cull, self.near)
 		end
+		return accepted
 	elseif op == Gpu.OP.PRESENT then
 		if self.framebuffer ~= nil then
 			self.framebuffer.presentRequested = true
 		end
+		return true
 	end
+	return false
 end
 
---- Run every queued command. Called by the host once per CPU budget.
+--- Run a bounded guest command queue. Invalid descriptors or malformed commands
+--- are rejected instead of allowing unbounded work or raw buffer exceptions.
 function Gpu:pump(): number
 	if not self.pending then
 		return 0
 	end
 	self.pending = false
-	local executed = 0
-	for index = 0, self.queueCount - 1 do
-		self:execute(self.queueBase + index * Gpu.COMMAND_SIZE)
-		executed += 1
+	if self.queueCount < 0 or self.queueCount % 1 ~= 0 or self.queueCount > Gpu.MAX_QUEUE_COMMANDS
+		or (self.queueCount > 0 and not self.memory:containsRange(self.queueBase, self.queueCount * Gpu.COMMAND_SIZE))
+	then
+		self.queueFaults += 1
+		self.status = 3
+		return 0
 	end
+
+	self.raster.workRemaining = Raster.MAX_WORK
+	self.raster.workLimitHit = false
+	local executed = 0
+	local failed = false
+	for index = 0, self.queueCount - 1 do
+		executed += 1
+		if not self:execute(self.queueBase + index * Gpu.COMMAND_SIZE) or self.raster.workLimitHit then
+			self.queueFaults += 1
+			failed = true
+			break
+		end
+	end
+	self.raster.workRemaining = nil
 	self.commandsRun += executed
-	self.status = 2
+	self.status = if failed then 3 else 2
 	return executed
 end
 

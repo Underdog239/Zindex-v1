@@ -97,8 +97,14 @@ function Zindex.new(options): any
 	self.coreDevices = {}
 	self.presents = 0
 	self.entry = 0
-	self.onTrap = opts.onTrap
+	self.onTrap = opts.onTrap -- ECALL host-call handler
+	self.onMemoryTrap = opts.onMemoryTrap -- invalid memory-access notification
 	self.onInterrupt = opts.onInterrupt
+	if self.onMemoryTrap ~= nil then
+		self.memory.onTrap = function(reason: number, address: number)
+			self.onMemoryTrap(self, self.cores[1], reason, address)
+		end
+	end
 
 	self.devices = Devices.attach(self.memory, {
 		clock = function(): number
@@ -130,6 +136,11 @@ function Zindex.new(options): any
 	for idx = 2, self.coreCount do
 		local mem = Memory.new(self.ramSize)
 		mem:setShared(self.shared, self.sharedWords)
+		if self.onMemoryTrap ~= nil then
+			mem.onTrap = function(reason: number, address: number)
+				self.onMemoryTrap(self, self.cores[idx], reason, address)
+			end
+		end
 		self.memories[idx] = mem
 		self.coreDevices[idx] = Devices.attach(mem, {
 			clock = function(): number
@@ -199,12 +210,22 @@ local function wireCore(self, core, devHandles)
 	end
 end
 
+local function validateLoadRange(memory: Memory.Class, address: number, size: number, label: string)
+	if not memory:containsRange(address, size) then
+		error('zindex: ' .. label .. ' is outside RAM', 0)
+	end
+end
+
 --- Load an Assembler result: copy the code in, set the entry, build the core(s).
 function Zindex:loadProgram(result): any
+	local codeSize = buffer.len(result.code)
+	validateLoadRange(self.memory, result.origin, codeSize, 'program image')
+	validateLoadRange(self.memory, result.entry, 1, 'entry point')
+
 	self.entry = result.entry
 	for idx = 1, self.coreCount do
 		local mem = self.memories[idx]
-		mem:copyIn(result.origin, result.code, 0, buffer.len(result.code))
+		mem:copyIn(result.origin, result.code, 0, codeSize)
 		local core = Core.new(mem, result.entry, self.tier)
 		wireCore(self, core, self.coreDevices[idx])
 		self.cores[idx] = core
@@ -223,12 +244,21 @@ end
 --- Load a packed program image (see Image.luau).
 function Zindex:loadImage(blob: buffer): any
 	local program = Image.unpack(blob)
+	local codeSize = buffer.len(program.code)
+	local dataSize = buffer.len(program.data)
+	if program.ramSize > 0 and program.ramSize > self.ramSize then
+		error('zindex: image requires more RAM than this chip provides', 0)
+	end
+	validateLoadRange(self.memory, program.codeAddress, codeSize, 'image code')
+	validateLoadRange(self.memory, program.dataAddress, dataSize, 'image data')
+	validateLoadRange(self.memory, program.entry, 1, 'image entry point')
+
 	self.entry = program.entry
 	for idx = 1, self.coreCount do
 		local mem = self.memories[idx]
-		mem:copyIn(program.codeAddress, program.code, 0, buffer.len(program.code))
-		if buffer.len(program.data) > 0 then
-			mem:copyIn(program.dataAddress, program.data, 0, buffer.len(program.data))
+		mem:copyIn(program.codeAddress, program.code, 0, codeSize)
+		if dataSize > 0 then
+			mem:copyIn(program.dataAddress, program.data, 0, dataSize)
 		end
 		local core = Core.new(mem, program.entry, self.tier)
 		wireCore(self, core, self.coreDevices[idx])
@@ -391,7 +421,7 @@ function Zindex:setInput(buttons: number, pointerX: number, pointerY: number, wh
 	self.devices.input.wheel = wheel or 0
 end
 
---- Pull up to `maxSamples` float32 samples from the guest's AUDIO ring buffer.
+--- Pull up to `maxSamples` float32 samples from AUDIO (at most 4096 per call).
 function Zindex:pullAudio(maxSamples: number?): { number }
 	local audio = self.devices.audio
 	local ram = self.memory:getRam()
@@ -399,12 +429,19 @@ function Zindex:pullAudio(maxSamples: number?): { number }
 	if audio.length <= 0 or audio.base <= 0 then
 		return {}
 	end
+	local requested = 4096
+	if maxSamples ~= nil then
+		if maxSamples ~= maxSamples or maxSamples <= 0 then
+			return {}
+		end
+		requested = math.min(math.floor(maxSamples), 4096)
+	end
 	local available = (audio.writeCursor - audio.readCursor) % audio.length
-	local count = if maxSamples ~= nil then math.min(available, maxSamples) else available
+	local count = math.min(available, requested)
 	local samples = table.create(count)
 	for i = 1, count do
 		local addr = audio.base + audio.readCursor * 4
-		if addr + 4 <= ramSize then
+		if addr >= 0 and addr + 4 <= ramSize then
 			samples[i] = buffer.readf32(ram, addr)
 		else
 			samples[i] = 0
@@ -419,41 +456,315 @@ function Zindex:framebuffer(): (any, buffer)
 	return self.devices.framebuffer, self.memory:getRam()
 end
 
---- Exact machine state. Deterministic execution is what makes this exact.
-function Zindex:snapshot(): any
-	local core = self.core
-	local vecs = table.create(8)
-	for i = 1, 8 do
-		vecs[i] = core.vecs[i]
+local function cloneBuffer(source: buffer): buffer
+	local copy = buffer.create(buffer.len(source))
+	buffer.copy(copy, 0, source, 0, buffer.len(source))
+	return copy
+end
+
+local function clonePlain(value: any): any
+	if type(value) ~= 'table' then
+		return value
 	end
-	local regsCopy = buffer.create(128)
-	buffer.copy(regsCopy, 0, core.regs, 0, 128)
+	local copy = {}
+	for key, item in value do
+		if type(item) ~= 'function' then
+			copy[key] = clonePlain(item)
+		end
+	end
+	return copy
+end
+
+local function restorePlain(target: any, saved: any)
+	for key, value in saved do
+		local current = target[key]
+		if type(value) == 'table' and type(current) == 'table' then
+			restorePlain(current, value)
+		elseif type(current) ~= 'function' then
+			target[key] = value
+		end
+	end
+end
+
+local function snapshotCore(core): any
+	local regs = buffer.create(128)
+	buffer.copy(regs, 0, core.regs, 0, 128)
+	local vecs = table.create(8)
+	for index = 1, 8 do
+		vecs[index] = core.vecs[index]
+	end
 	return {
-		regs = regsCopy,
-		ram = buffer.fromstring(buffer.tostring(self.memory:getRam())),
+		regs = regs,
+		vecs = vecs,
 		pc = core.pc,
 		cycles = core.cycles,
 		steps = core.steps,
 		halted = core.halted,
 		exitCode = core.exitCode,
-		vecs = vecs,
+		yielded = core.yielded,
+		syncWaiting = core.syncWaiting,
+		traps = core.traps,
+		tier = core.tier,
+		irqEnabled = core.irqEnabled,
+		irqVector = core.irqVector,
+		irqReturnPc = core.irqReturnPc,
+		stats = clonePlain(core.stats),
+	}
+end
+
+local function snapshotGpu(gpu): any
+	if gpu == nil then
+		return nil
+	end
+	return {
+		queueBase = gpu.queueBase,
+		queueCount = gpu.queueCount,
+		pending = gpu.pending,
+		status = gpu.status,
+		commandsRun = gpu.commandsRun,
+		queueFaults = gpu.queueFaults,
+		near = gpu.near,
+		colourAddress = gpu.colourAddress,
+		depthAddress = gpu.depthAddress,
+		tileCount = gpu.tileCount,
+		scissorX = gpu.scissorX,
+		scissorY = gpu.scissorY,
+		scissorW = gpu.scissorW,
+		scissorH = gpu.scissorH,
+		scale = gpu.scale,
+		minScale = gpu.minScale,
+		maxScale = gpu.maxScale,
+		adaptive = gpu.adaptive,
+		targetFps = gpu.targetFps,
+		baseWidth = gpu.baseWidth,
+		baseHeight = gpu.baseHeight,
+		width = gpu.width,
+		height = gpu.height,
+		raster = {
+			colourBase = gpu.raster.colourBase,
+			depthBase = gpu.raster.depthBase,
+			cull = gpu.raster.cull,
+			scissorX = gpu.raster.scissorX,
+			scissorY = gpu.raster.scissorY,
+			scissorW = gpu.raster.scissorW,
+			scissorH = gpu.raster.scissorH,
+			stats = clonePlain(gpu.raster.stats),
+		},
+	}
+end
+
+local function snapshotNpu(npu): any
+	return {
+		queueBase = npu.queueBase,
+		queueCount = npu.queueCount,
+		pending = npu.pending,
+		status = npu.status,
+		commandsRun = npu.commandsRun,
+		queueFaults = npu.queueFaults,
+		stats = clonePlain(npu.stats),
+	}
+end
+
+local function snapshotShared(storage): any
+	if type(storage) == 'buffer' then
+		return { kind = 'buffer', value = cloneBuffer(storage) }
+	end
+	local values = {}
+	for key, value in storage do
+		values[key] = value
+	end
+	return { kind = 'table', value = values }
+end
+
+local function restoreShared(storage, saved)
+	if saved.kind == 'buffer' then
+		if type(storage) ~= 'buffer' or buffer.len(storage) ~= buffer.len(saved.value) then
+			error('zindex: save state shared-memory shape does not match chip', 0)
+		end
+		buffer.copy(storage, 0, saved.value, 0, buffer.len(saved.value))
+		return
+	end
+	if type(storage) == 'buffer' then
+		error('zindex: save state shared-memory shape does not match chip', 0)
+	end
+	local keys = {}
+	for key in storage do
+		keys[#keys + 1] = key
+	end
+	for _, key in keys do
+		storage[key] = nil
+	end
+	for key, value in saved.value do
+		storage[key] = value
+	end
+end
+
+--- Snapshot all architectural state (cores, RAM, devices, shared memory, GPU and NPU).
+--- Compiled blocks are deliberately omitted and rebuilt on restore.
+function Zindex:snapshot(): any
+	if self.core == nil then
+		error('zindex: no program loaded', 0)
+	end
+	local coreStates = table.create(self.coreCount)
+	local memoryStates = table.create(self.coreCount)
+	local deviceStates = table.create(self.coreCount)
+	for index = 1, self.coreCount do
+		local core = self.cores[index]
+		local memory = self.memories[index]
+		coreStates[index] = snapshotCore(core)
+		memoryStates[index] = {
+			ram = cloneBuffer(memory:getRam()),
+			lastCost = memory.lastCost,
+			faults = memory.faults,
+		}
+		deviceStates[index] = clonePlain(self.coreDevices[index])
+	end
+	local primary = coreStates[1]
+	return {
+		format = 2,
+		ramSize = self.ramSize,
+		coreCount = self.coreCount,
+		tier = self.tier,
+		entry = self.entry,
+		presents = self.presents,
+		cores = coreStates,
+		memories = memoryStates,
+		devices = deviceStates,
+		sharedWords = self.sharedWords,
+		shared = snapshotShared(self.shared),
+		gpu = snapshotGpu(self.gpu),
+		npu = snapshotNpu(self.npu),
+		-- Preserve the original single-core convenience fields.
+		regs = primary.regs,
+		ram = memoryStates[1].ram,
+		pc = primary.pc,
+		cycles = primary.cycles,
+		steps = primary.steps,
+		halted = primary.halted,
+		exitCode = primary.exitCode,
+		vecs = primary.vecs,
 	}
 end
 
 function Zindex:restore(state)
-	local core = self.core
-	buffer.fill(core.regs, 0, 0, 132)
-	buffer.copy(core.regs, 0, state.regs, 0, math.min(128, buffer.len(state.regs)))
-	buffer.copy(self.memory:getRam(), 0, state.ram)
-	core.pc = state.pc
-	core.cycles = state.cycles
-	core.steps = state.steps
-	core.halted = state.halted
-	core.exitCode = state.exitCode
-	for i = 1, 8 do
-		core.vecs[i] = state.vecs[i]
+	if type(state) ~= 'table' or state.format ~= 2 then
+		error('zindex: unsupported or malformed save state', 0)
 	end
-	core:invalidateAll()
+	if type(state.cores) ~= 'table' or type(state.memories) ~= 'table' or type(state.devices) ~= 'table'
+		or type(state.shared) ~= 'table' or type(state.npu) ~= 'table'
+		or state.ramSize ~= self.ramSize or state.coreCount ~= self.coreCount or state.sharedWords ~= self.sharedWords
+		or #state.cores ~= self.coreCount or #state.memories ~= self.coreCount or #state.devices ~= self.coreCount
+		or ((state.gpu ~= nil) ~= (self.gpu ~= nil))
+	then
+		error('zindex: save state configuration does not match chip', 0)
+	end
+	if (state.shared.kind == 'buffer' and type(self.shared) ~= 'buffer')
+		or (state.shared.kind == 'table' and type(self.shared) == 'buffer')
+		or (state.shared.kind ~= 'buffer' and state.shared.kind ~= 'table')
+		or (state.shared.kind == 'buffer' and (type(state.shared.value) ~= 'buffer' or buffer.len(state.shared.value) ~= buffer.len(self.shared)))
+		or (state.shared.kind == 'table' and type(state.shared.value) ~= 'table')
+		or type(state.npu.stats) ~= 'table'
+		or (self.gpu ~= nil and (type(state.gpu) ~= 'table' or type(state.gpu.raster) ~= 'table'
+			or type(state.gpu.raster.stats) ~= 'table'))
+	then
+		error('zindex: save state device shape does not match chip', 0)
+	end
+	for index = 1, self.coreCount do
+		local coreState = state.cores[index]
+		local memoryState = state.memories[index]
+		if type(coreState) ~= 'table' or type(memoryState) ~= 'table' or type(state.devices[index]) ~= 'table'
+			or type(coreState.stats) ~= 'table' or type(coreState.vecs) ~= 'table' or #coreState.vecs ~= 8
+			or type(coreState.regs) ~= 'buffer' or buffer.len(coreState.regs) ~= 128
+			or type(memoryState.ram) ~= 'buffer' or buffer.len(memoryState.ram) ~= self.ramSize
+		then
+			error('zindex: save state buffer shape does not match chip', 0)
+		end
+	end
+
+	self.tier = state.tier
+	self.entry = state.entry
+	self.presents = state.presents
+	for index = 1, self.coreCount do
+		local memory = self.memories[index]
+		local memoryState = state.memories[index]
+		buffer.copy(memory:getRam(), 0, memoryState.ram, 0, self.ramSize)
+		restorePlain(self.coreDevices[index], state.devices[index])
+	end
+	restoreShared(self.shared, state.shared)
+
+	for index = 1, self.coreCount do
+		local core = self.cores[index]
+		local saved = state.cores[index]
+		local memory = self.memories[index]
+		buffer.fill(core.regs, 0, 0, 132)
+		buffer.copy(core.regs, 0, saved.regs, 0, 128)
+		for vectorIndex = 1, 8 do
+			core.vecs[vectorIndex] = saved.vecs[vectorIndex]
+		end
+		core.pc = saved.pc
+		core.cycles = saved.cycles
+		core.steps = saved.steps
+		core.halted = saved.halted
+		core.exitCode = saved.exitCode
+		core.yielded = saved.yielded
+		core.syncWaiting = saved.syncWaiting
+		core.traps = saved.traps
+		core.tier = saved.tier
+		core.irqEnabled = saved.irqEnabled
+		core.irqVector = saved.irqVector
+		core.irqReturnPc = saved.irqReturnPc
+		core:invalidateAll()
+		restorePlain(core.stats, saved.stats)
+		memory.lastCost = state.memories[index].lastCost
+		memory.faults = state.memories[index].faults
+	end
+	self.core = self.cores[1]
+
+	if self.gpu ~= nil then
+		local gpu = self.gpu
+		local saved = state.gpu
+		gpu.minScale = saved.minScale
+		gpu.maxScale = saved.maxScale
+		gpu.adaptive = saved.adaptive
+		gpu.targetFps = saved.targetFps
+		gpu.baseWidth = saved.baseWidth
+		gpu.baseHeight = saved.baseHeight
+		gpu:setResolutionScale(saved.scale)
+		gpu.width = saved.width
+		gpu.height = saved.height
+		gpu.raster:resize(saved.width, saved.height)
+		gpu.queueBase = saved.queueBase
+		gpu.queueCount = saved.queueCount
+		gpu.pending = saved.pending
+		gpu.status = saved.status
+		gpu.commandsRun = saved.commandsRun
+		gpu.queueFaults = saved.queueFaults
+		gpu.near = saved.near
+		gpu.colourAddress = saved.colourAddress
+		gpu.depthAddress = saved.depthAddress
+		gpu.tileCount = saved.tileCount
+		gpu.scissorX = saved.scissorX
+		gpu.scissorY = saved.scissorY
+		gpu.scissorW = saved.scissorW
+		gpu.scissorH = saved.scissorH
+		gpu.raster.colourBase = saved.raster.colourBase
+		gpu.raster.depthBase = saved.raster.depthBase
+		gpu.raster.cull = saved.raster.cull
+		gpu.raster:setScissor(saved.raster.scissorX, saved.raster.scissorY, saved.raster.scissorW, saved.raster.scissorH)
+		restorePlain(gpu.raster.stats, saved.raster.stats)
+		gpu.raster.workRemaining = nil
+		gpu.raster.workLimitHit = false
+	end
+
+	local npu = self.npu
+	local savedNpu = state.npu
+	npu.queueBase = savedNpu.queueBase
+	npu.queueCount = savedNpu.queueCount
+	npu.pending = savedNpu.pending
+	npu.status = savedNpu.status
+	npu.commandsRun = savedNpu.commandsRun
+	npu.queueFaults = savedNpu.queueFaults
+	restorePlain(npu.stats, savedNpu.stats)
 end
 
 return Zindex

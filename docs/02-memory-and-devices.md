@@ -12,10 +12,16 @@ Default profile:
 | 0x0000_0000 - 0x03FF_FFFF | RAM (up to 64 MiB; recommended 1-16 MiB) |
 | 0x0400_0000 - 0x0EFF_FFFF | reserved |
 | 0x0F00_0000 - 0x0FFF_FFFF | device window (16 MiB, 4 KiB per device page) |
-| 0xFF00_0000 - 0xFFFF_FFFF | trap page: any access raises a host trap |
+| 0xFF00_0000 - 0xFFFF_FFFF | reserved trap page |
 
-RAM is a single `buffer`. Code, data, stack and heap all live in it (von Neumann), which keeps
-save states trivial: one buffer is the machine's entire memory.
+RAM is a single `buffer`. Code, data, stack and heap all live in it (von Neumann). Every
+multi-byte RAM access must fit wholly inside RAM; crossing or unmapped accesses return zero on reads,
+discard writes, and increment the memory fault counter instead of throwing a host buffer error.
+If supplied, `Zindex.new({ onMemoryTrap = fn })` is called for each such access as
+`fn(chip, coreOrNil, reason, address)`; this is separate from `onTrap`, the ECALL host-call
+handler. `reason` is `Zindex.Memory.FAULT.INVALID_ACCESS`. This includes addresses outside RAM,
+missing device pages, and unsupported MMIO access widths. Without a callback, the safe
+zero/discard behavior still applies.
 
 The code region is write-protected *by convention*, not by hardware. A write into the code
 region must invalidate any compiled blocks covering that address (doc 03). Self-modifying code
@@ -40,7 +46,8 @@ a handful of registers.
 | 0x0F008000+ | user | reserved for future devices |
 
 Reading a device register is an ordinary LW. There is no separate I/O instruction class, so
-there is no second decode path to maintain.
+there is no second decode path to maintain. The AUDIO ring length is capped at the number of
+float32 samples that fit in RAM, and the host returns at most 4096 samples per `pullAudio()` call.
 
 ## 3. Framebuffer device
 
@@ -106,6 +113,11 @@ A Zindex program image is one buffer:
 | +0x14 | code load address |
 | +0x18 | code bytes |
 | ... | initial data bytes |
+
+The unpacker verifies that the declared code section fits in the supplied buffer, that segment
+address arithmetic does not wrap the 32-bit address space, and (when `ramSize` is nonzero) that
+segments and the entry fit in the declared RAM. `chip:loadImage()` additionally verifies all
+segments against the actual chip RAM before copying any bytes. An empty data section stays empty.
 
 No claim is made about where images are stored. Persistence is a host concern, and the host's
 options are limited (doc 04). Zindex defines the image, not the shelf.

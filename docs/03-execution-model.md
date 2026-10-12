@@ -48,14 +48,17 @@ a byte-identical machine state every time.
 
 ## 4. Save states, replay, rollback
 
-Machine state is: registers buffer + core state (PC, cycle counter, pending interrupts) + RAM
-buffer + device register file. Serialization is concatenation of buffers; deserialization is the
-reverse.
+`chip:snapshot()` captures every core's registers and control state, private RAM, device register
+files, shared memory, GPU/NPU queues and counters, and host-visible present count. `chip:restore(state)`
+requires a compatible chip with the same RAM size, core count, shared-memory shape, and optional-GPU
+presence; it restores those values and invalidates compiled blocks so they are rebuilt from RAM.
+The snapshot is an in-memory Lua table containing cloned buffers; applications that need
+persistence must serialize that table using their chosen storage format. Take snapshots at a
+scheduler safe point with all cores quiescent so shared memory is consistent.
 
-Because the core is deterministic - no wall clock, no RNG, no engine callbacks in the compute
-path - save states are exact and replay is exact. That enables rewind, deterministic replays, and
-rollback: keep the last N states and re-simulate forward. None of this is possible if determinism
-is retrofitted, which is why it is a principle rather than a feature.
+Host callbacks and compiled code caches are intentionally not serialized. With deterministic
+execution and the same callback behavior, replay is exact. This enables rewind and rollback: keep
+the last N states and re-simulate forward.
 
 ## 5. Native-readiness rules
 

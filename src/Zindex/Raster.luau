@@ -27,6 +27,27 @@ Raster.__index = Raster
 Raster.FLAT = 0
 Raster.GOURAUD = 1
 Raster.TEXTURED = 2
+Raster.MAX_WORK = 1000000
+Raster.MAX_TRIANGLES = 8192
+Raster.MAX_VERTICES = 1000000
+Raster.MAX_TEXTURE_PIXELS = 1048576
+
+local function bufferRangeFits(target: buffer, address: number, size: number): boolean
+	if address ~= address or size ~= size or address % 1 ~= 0 or size % 1 ~= 0 then
+		return false
+	end
+	if address < 0 or size < 0 or address > buffer.len(target) then
+		return false
+	end
+	return size <= buffer.len(target) - address
+end
+
+local function finiteOrZero(value: number): number
+	if value ~= value or value == math.huge or value == -math.huge then
+		return 0
+	end
+	return value
+end
 
 local function packRGBA(r: number, g: number, b: number, a: number): number
 	return r + g * 256 + b * 65536 + a * 16777216
@@ -46,7 +67,9 @@ function Raster.new(memory: Memory.Class, width: number, height: number, colour:
 	self.scissorW = width
 	self.scissorH = height
 	self.cull = true
-	self.stats = { triangles = 0, drawn = 0, culled = 0, clipped = 0, fragments = 0, tilesComposited = 0 }
+	self.stats = { triangles = 0, drawn = 0, culled = 0, clipped = 0, fragments = 0, tilesComposited = 0, workLimitHits = 0 }
+	self.workRemaining = nil
+	self.workLimitHit = false
 
 	-- Scratch, sized for one clipped triangle (a triangle clipped by a single
 	-- plane has at most four vertices). Allocated once, reused forever.
@@ -92,14 +115,19 @@ function Raster:resize(width: number, height: number)
 end
 
 function Raster:setScissor(x: number, y: number, w: number, h: number)
-	self.scissorX = x
-	self.scissorY = y
-	self.scissorW = w
-	self.scissorH = h
+	local x0 = math.clamp(math.floor(finiteOrZero(x)), 0, self.width)
+	local y0 = math.clamp(math.floor(finiteOrZero(y)), 0, self.height)
+	local right = math.clamp(math.floor(finiteOrZero(x) + math.max(0, finiteOrZero(w))), 0, self.width)
+	local bottom = math.clamp(math.floor(finiteOrZero(y) + math.max(0, finiteOrZero(h))), 0, self.height)
+	self.scissorX = x0
+	self.scissorY = y0
+	self.scissorW = math.max(0, right - x0)
+	self.scissorH = math.max(0, bottom - y0)
 end
 
---- Fill the colour plane with one packed word and clear depth to 0.
-function Raster:clear(word: number)
+--- Fill the colour plane with one packed word and clear depth to 0. Returns
+--- false without touching memory if either plane or the bounded work budget fails.
+function Raster:clear(word: number): boolean
 	local colour: buffer = self.colour
 	local depth: buffer = self.depth
 	local width: number = self.width
@@ -111,6 +139,16 @@ function Raster:clear(word: number)
 	local scY: number = self.scissorY
 	local scW: number = self.scissorW
 	local scH: number = self.scissorH
+	local planeBytes = height * stride
+	local work = scW * scH + width * height
+	local remaining = self.workRemaining or Raster.MAX_WORK
+	if not bufferRangeFits(colour, colourBase, planeBytes)
+		or not bufferRangeFits(depth, depthBase, planeBytes)
+		or work > remaining
+	then
+		return false
+	end
+
 	-- buffer.fill writes a *byte* value, so a packed colour has to be written
 	-- one 32-bit word at a time. Filling with the word would silently write
 	-- only its low byte.
@@ -124,6 +162,10 @@ function Raster:clear(word: number)
 	for row = 0, height - 1 do
 		buffer.fill(depth, depthBase + row * stride, 0, stride)
 	end
+	if self.workRemaining ~= nil then
+		self.workRemaining -= work
+	end
+	return true
 end
 
 function Raster:resetStats()
@@ -133,6 +175,7 @@ function Raster:resetStats()
 	self.stats.clipped = 0
 	self.stats.fragments = 0
 	self.stats.tilesComposited = 0
+	self.stats.workLimitHits = 0
 end
 
 --=====================================================================
@@ -170,10 +213,19 @@ local function transformVertex(m: { number }, ax: { number }, ay: { number }, az
 	aw[index] = m[13] * x + m[14] * y + m[15] * z + m[16]
 end
 
---- Draw a mesh. Returns the number of triangles that reached the rasteriser.
-function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: number, textureAddress: number, cull: boolean?, near: number?): number
+--- Draw a mesh. Returns the number of triangles that reached the rasteriser
+--- and whether all guest-controlled inputs were valid.
+function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: number, textureAddress: number, cull: boolean?, near: number?): (number, boolean)
 	local memory = self.memory
 	local ram: buffer = memory.ram
+	local viewportBytes = self.width * self.height * 4
+	if not memory:containsRange(meshAddress, 24)
+		or not memory:containsRange(matrixAddress, 64)
+		or not bufferRangeFits(self.colour, self.colourBase, viewportBytes)
+		or not bufferRangeFits(self.depth, self.depthBase, viewportBytes)
+	then
+		return 0, false
+	end
 	local vertexCount: number = memory:read32(meshAddress + 0x00)
 	local positionAddress: number = memory:read32(meshAddress + 0x04)
 	local colourAddress: number = memory:read32(meshAddress + 0x08)
@@ -181,15 +233,31 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 	local indexAddress: number = memory:read32(meshAddress + 0x10)
 	local indexCount: number = memory:read32(meshAddress + 0x14)
 	if indexCount == 0 or vertexCount == 0 then
-		return 0
+		return 0, true
+	end
+	local triangleCount = math.floor(indexCount / 3)
+	if vertexCount > Raster.MAX_VERTICES or triangleCount > Raster.MAX_TRIANGLES
+		or not memory:containsRange(positionAddress, vertexCount * 12)
+		or (colourAddress ~= 0 and not memory:containsRange(colourAddress, vertexCount * 4))
+		or (uvAddress ~= 0 and not memory:containsRange(uvAddress, vertexCount * 8))
+		or (indexAddress ~= 0 and not memory:containsRange(indexAddress, indexCount * 4))
+	then
+		return 0, false
+	end
+	local nearPlane: number = near or 0.0001
+	if nearPlane ~= nearPlane or nearPlane == math.huge or nearPlane <= 0 then
+		return 0, false
 	end
 
 	local m: { number } = self.matrixValues
 	for i = 0, 15 do
-		m[i + 1] = buffer.readf32(ram, matrixAddress + i * 4)
+		local value = buffer.readf32(ram, matrixAddress + i * 4)
+		if value ~= value or value == math.huge or value == -math.huge then
+			return 0, false
+		end
+		m[i + 1] = value
 	end
 
-	local nearPlane: number = near or 0.0001
 	if cull ~= nil then
 		self.cull = cull
 	end
@@ -197,9 +265,22 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 
 	local texWidth: number, texHeight: number, texPixels: number = 0, 0, 0
 	if shading == Raster.TEXTURED and textureAddress ~= 0 then
+		if not memory:containsRange(textureAddress, 12) then
+			return 0, false
+		end
 		texWidth = memory:read32(textureAddress + 0x00)
 		texHeight = memory:read32(textureAddress + 0x04)
 		texPixels = memory:read32(textureAddress + 0x08)
+		if texWidth > 0 and texHeight > 0 then
+			if texWidth > math.floor(Raster.MAX_TEXTURE_PIXELS / texHeight)
+				or not memory:containsRange(texPixels, texWidth * texHeight * 4)
+			then
+				return 0, false
+			end
+		else
+			texWidth = 0
+			texHeight = 0
+		end
 	end
 
 	local width: number = self.width
@@ -223,8 +304,26 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 
 	local triangles: number = math.floor(indexCount / 3)
 	local rasterized: number, fragments: number, written: number = 0, 0, 0
+	local workRemaining = self.workRemaining or Raster.MAX_WORK
+	if workRemaining < 0 or workRemaining % 1 ~= 0 then
+		return 0, false
+	end
+	self.workLimitHit = false
 	for triangle = 0, triangles - 1 do
+		if workRemaining < 1 then
+			self.stats.workLimitHits += 1
+			self.workLimitHit = true
+			if self.workRemaining ~= nil then
+				self.workRemaining = 0
+			end
+			break
+		end
+		workRemaining -= 1
+		if self.workRemaining ~= nil then
+			self.workRemaining = workRemaining
+		end
 		self.stats.triangles += 1
+		local validTriangle = true
 
 		-- Gather the three vertices.
 		for corner = 1, 3 do
@@ -249,6 +348,15 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 				buffer.readf32(ram, positionOffset + 4),
 				buffer.readf32(ram, positionOffset + 8)
 			)
+			if ax[corner] ~= ax[corner] or ay[corner] ~= ay[corner] or az[corner] ~= az[corner] or aw[corner] ~= aw[corner]
+				or ax[corner] == math.huge or ax[corner] == -math.huge
+				or ay[corner] == math.huge or ay[corner] == -math.huge
+				or az[corner] == math.huge or az[corner] == -math.huge
+				or aw[corner] == math.huge or aw[corner] == -math.huge
+			then
+				validTriangle = false
+				break
+			end
 			if colourAddress ~= 0 then
 				local word = buffer.readu32(ram, colourAddress + index * 4)
 				ar[corner] = (word % 256) / 255
@@ -259,11 +367,20 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 				ar[corner], ag[corner], ab[corner], aa[corner] = 1, 1, 1, 1
 			end
 			if uvAddress ~= 0 then
-				au[corner] = buffer.readf32(ram, uvAddress + index * 8)
-				av[corner] = buffer.readf32(ram, uvAddress + index * 8 + 4)
+				local u = buffer.readf32(ram, uvAddress + index * 8)
+				local v = buffer.readf32(ram, uvAddress + index * 8 + 4)
+				if u ~= u or v ~= v or u == math.huge or u == -math.huge or v == math.huge or v == -math.huge then
+					validTriangle = false
+					break
+				end
+				au[corner], av[corner] = u, v
 			else
 				au[corner], av[corner] = 0, 0
 			end
+		end
+		if not validTriangle then
+			self.stats.clipped += 1
+			continue
 		end
 
 		-- Clip against the near plane (w > near), producing 0, 3 or 4 vertices.
@@ -352,6 +469,20 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 			if xmin > xmax or ymin > ymax then
 				continue
 			end
+			local candidatePixels = (xmax - xmin + 1) * (ymax - ymin + 1)
+			if candidatePixels > workRemaining then
+				self.stats.workLimitHits += 1
+				self.workLimitHit = true
+				workRemaining = 0
+				if self.workRemaining ~= nil then
+					self.workRemaining = 0
+				end
+				break
+			end
+			workRemaining -= candidatePixels
+			if self.workRemaining ~= nil then
+				self.workRemaining = workRemaining
+			end
 
 			local iw0, iw1, iw2 = siw[1], siw[k], siw[k + 1]
 			local r0p, r1p, r2p = spr[1], spr[k], spr[k + 1]
@@ -412,12 +543,18 @@ function Raster:drawMesh(meshAddress: number, matrixAddress: number, shading: nu
 					offset += 4
 				end
 			end
+			if self.workLimitHit then
+				break
+			end
+		end
+		if self.workLimitHit then
+			break
 		end
 	end
 
 	self.stats.fragments += fragments
 	self.stats.drawn += written
-	return rasterized
+	return rasterized, true
 end
 
 --- Composite a tile buffer into the target colour and depth planes using one
@@ -450,24 +587,56 @@ function Raster:drawMeshTiled(
 	textureAddress: number,
 	cull: boolean?,
 	near: number?
-): number
+): (number, boolean)
 	if tileCount <= 1 then
 		return self:drawMesh(meshAddress, matrixAddress, shading, textureAddress, cull, near)
 	end
 
 	local width: number = self.width
 	local height: number = self.height
+	if height <= 0 then
+		return 0, false
+	end
+	tileCount = math.clamp(math.floor(finiteOrZero(tileCount)), 1, math.min(64, height))
+	if tileCount <= 1 then
+		return self:drawMesh(meshAddress, matrixAddress, shading, textureAddress, cull, near)
+	end
 	local planeBytes: number = width * height * 4
 	local origColour: buffer = self.colour
 	local origDepth: buffer = self.depth
 	local origColourBase: number = self.colourBase
 	local origDepthBase: number = self.depthBase
 	local origScX, origScY, origScW, origScH = self.scissorX, self.scissorY, self.scissorW, self.scissorH
+	if not bufferRangeFits(origColour, origColourBase, planeBytes)
+		or not bufferRangeFits(origDepth, origDepthBase, planeBytes)
+	then
+		return 0, false
+	end
 
+	local ownsBudget = self.workRemaining == nil
+	if ownsBudget then
+		self.workRemaining = Raster.MAX_WORK
+	end
+	self.workLimitHit = false
+	local copyWork = width * height
+	if copyWork > self.workRemaining then
+		self.stats.workLimitHits += 1
+		self.workLimitHit = true
+		if ownsBudget then
+			self.workRemaining = nil
+		else
+			self.workRemaining = 0
+		end
+		return 0, true
+	end
+	self.workRemaining -= copyWork
 	local tileColour = buffer.create(planeBytes)
 	local tileDepth = buffer.create(planeBytes)
+	buffer.copy(tileColour, 0, origColour, origColourBase, planeBytes)
+	buffer.copy(tileDepth, 0, origDepth, origDepthBase, planeBytes)
 
 	local totalRasterized = 0
+	local valid = true
 	local bandHeight = math.ceil(origScH / tileCount)
 
 	for t = 0, tileCount - 1 do
@@ -494,17 +663,31 @@ function Raster:drawMeshTiled(
 		self.colourBase = 0
 		self.depthBase = 0
 		self:setScissor(x0, y0, w, h)
-		totalRasterized += self:drawMesh(meshAddress, matrixAddress, shading, textureAddress, cull, near)
+		local rasterized, accepted = self:drawMesh(meshAddress, matrixAddress, shading, textureAddress, cull, near)
+		totalRasterized += rasterized
+		if not accepted then
+			valid = false
+		end
 
 		self.colour = origColour
 		self.depth = origDepth
 		self.colourBase = origColourBase
 		self.depthBase = origDepthBase
-		self:compositeTile(tileColour, tileDepth, x0, y0, w, h)
+		if accepted then
+			self:compositeTile(tileColour, tileDepth, x0, y0, w, h)
+		else
+			valid = false
+		end
+		if not valid or self.workLimitHit then
+			break
+		end
 	end
 
 	self:setScissor(origScX, origScY, origScW, origScH)
-	return totalRasterized
+	if ownsBudget then
+		self.workRemaining = nil
+	end
+	return totalRasterized, valid
 end
 
 return Raster
