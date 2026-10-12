@@ -35,8 +35,17 @@ local view = Zindex.RobloxView.new(chip, { parent = script.Parent })
 view:start(50000)   -- cycles per frame
 ```
 
-`Examples/demo.luau` is a complete program: it fills 4096 pixels from machine code, asks the
-host to present, prints through a host call, and exits.
+Or upload a mesh and let guest machine code draw it through the graphics command queue:
+
+```lua
+chip.gpu.raster.stats.drawn   -- fragments written
+chip.devices.framebuffer.presentRequested
+```
+
+`Examples/demo.luau` fills 4096 pixels from machine code, asks the host to present, prints
+through a host call, and exits. `Examples/gpu.luau` uploads a mesh and a matrix, then has guest
+code draw a 3D cube through the command queue - transform, near clip, perspective divide,
+back-face cull, depth test and edge-function raster, all of it.
 
 ## Layout
 
@@ -44,6 +53,8 @@ host to present, prints through a host call, and exits.
 src/Zindex/Opcodes.luau     the instruction set as data
 src/Zindex/Memory.luau      address space: RAM buffer, device window, trap page
 src/Zindex/Devices.luau     DEV, TIMER, INPUT, AUDIO, IPC, FB
+src/Zindex/Raster.luau      transform, near clip, project, cull, edge-function raster
+src/Zindex/Gpu.luau         graphics unit: command queue, registers, queue pump
 src/Zindex/Core.luau        a CPU core: decode, execute, cycle accounting, disassembler
 src/Zindex/Assembler.luau   two-pass assembler: labels, expressions, directives, listing
 src/Zindex/Image.luau       program image pack and unpack
@@ -58,10 +69,12 @@ python3 Tests/bundle.py && luau Tests/combined.luau
 ```
 
 The bundler rewrites `require(script.Parent.X)` into a module table so the library runs unchanged
-outside Roblox. The suite drives the real core through the real assembler - 64 checks covering
+outside Roblox. The suite drives the real core through the real assembler - 83 checks covering
 arithmetic wrapping, 32-bit multiply exactness, shifts, signed and unsigned comparison, memory
 access with sign extension, control flow, calls, the vector unit, devices, host calls, the
-assembler, images, illegal opcodes, and byte-exact save state replay.
+assembler, images, illegal opcodes, byte-exact save state replay, and on the graphics side
+coverage, depth, interpolation, culling and the matrix convention, ending with assembled guest
+code that writes its own command queue and kicks the GPU.
 
 ## Documentation
 

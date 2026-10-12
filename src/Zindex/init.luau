@@ -31,6 +31,7 @@
 local Assembler = require(script.Parent.Assembler)
 local Core = require(script.Parent.Core)
 local Devices = require(script.Parent.Devices)
+local Gpu = require(script.Parent.Gpu)
 local Image = require(script.Parent.Image)
 local Memory = require(script.Parent.Memory)
 
@@ -44,6 +45,7 @@ Zindex.assemble = Assembler.assemble
 Zindex.Assembler = Assembler
 Zindex.Core = Core
 Zindex.Devices = Devices
+Zindex.Gpu = Gpu
 Zindex.Image = Image
 Zindex.Memory = Memory
 
@@ -109,6 +111,19 @@ function Zindex.new(options): any
 		coreId = opts.coreId or 0,
 		coreCount = opts.coreCount or 1,
 	})
+
+	-- The graphics unit exists only when a framebuffer was configured.
+	if (opts.width or 0) > 0 and (opts.height or 0) > 0 then
+		self.gpu = Gpu.attach(self.memory, {
+			framebuffer = self.devices.framebuffer,
+			width = opts.width,
+			height = opts.height,
+			colour = opts.back or 0,
+			depth = opts.depth or 0,
+		})
+	else
+		self.gpu = nil
+	end
 	return self
 end
 
@@ -167,7 +182,17 @@ function Zindex:run(cycles: number): number
 	if self.core == nil then
 		error('zindex: no program loaded', 0)
 	end
-	return self.core:run(cycles)
+	local used = self.core:run(cycles)
+	self:pumpGpu()
+	return used
+end
+
+--- Drain the graphics queue, if there is one and it has work.
+function Zindex:pumpGpu(): number
+	if self.gpu == nil then
+		return 0
+	end
+	return self.gpu:pump()
 end
 
 function Zindex:step(): number

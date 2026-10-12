@@ -399,6 +399,201 @@ do
 	check('illegal opcode is an error', ok == false)
 end
 
+
+--=====================================================================
+-- Raster unit
+--=====================================================================
+
+--- Write a float array into RAM.
+local function putFloats(ram, address, values)
+	for index, value in values do
+		buffer.writef32(ram, address + (index - 1) * 4, value)
+	end
+end
+
+--- identity matrix, then a mesh of one clip-space triangle
+local function scene(chip)
+	local ram = chip:ram()
+	putFloats(ram, 0x6000, {
+		1.0, 0.0, 0.0, 0.0,
+		0.0, 1.0, 0.0, 0.0,
+		0.0, 0.0, 1.0, 0.0,
+		0.0, 0.0, 0.0, 1.0,
+	})
+	putFloats(ram, 0x6100, { -1.0, -1.0, 0.0, 1.0, -1.0, 0.0, -1.0, 1.0, 0.0 })
+	buffer.writeu32(ram, 0x6200, 3)
+	buffer.writeu32(ram, 0x6204, 0x6100)
+	buffer.writeu32(ram, 0x6208, 0)
+	buffer.writeu32(ram, 0x620C, 0)
+	buffer.writeu32(ram, 0x6210, 0)
+	buffer.writeu32(ram, 0x6214, 3)
+	return ram
+end
+
+do
+	local chip = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000 })
+	local ram = scene(chip)
+	local raster = chip.gpu.raster
+	raster.colourBase = 0x4000
+	raster.depthBase = 0x5000
+	raster:setScissor(0, 0, 16, 16)
+	raster:clear(0xFF000000)
+
+	local drawn = raster:drawMesh(0x6200, 0x6000, 0, 0, false, 0.0001)
+	eq('one triangle reached the rasteriser', drawn, 1)
+	eq('inside pixel is drawn', buffer.readu32(ram, 0x4000 + (5 * 16 + 2) * 4), 0xFFFFFFFF)
+	eq('outside pixel keeps the clear colour', buffer.readu32(ram, 0x4000 + (2 * 16 + 5) * 4), 0xFF000000)
+	check('depth holds 1/w', math.abs(buffer.readf32(ram, 0x5000 + (5 * 16 + 2) * 4) - 1.0) < 1e-6)
+end
+
+do
+	-- Gouraud: red, green and blue at the three corners, then check that a
+	-- pixel next to the red corner is dominated by red.
+	local chip = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000 })
+	local ram = scene(chip)
+	buffer.writeu32(ram, 0x6300, 0xFF0000FF)
+	buffer.writeu32(ram, 0x6304, 0xFF00FF00)
+	buffer.writeu32(ram, 0x6308, 0xFFFF0000)
+	buffer.writeu32(ram, 0x6208, 0x6300)
+
+	local raster = chip.gpu.raster
+	raster.colourBase = 0x4000
+	raster.depthBase = 0x5000
+	raster:setScissor(0, 0, 16, 16)
+	raster:clear(0xFF000000)
+	raster:drawMesh(0x6200, 0x6000, 1, 0, false, 0.0001)
+
+	local word = buffer.readu32(ram, 0x4000 + (14 * 16 + 1) * 4)
+	local r = word % 256
+	local g = math.floor(word / 256) % 256
+	local b = math.floor(word / 65536) % 256
+	check('gouraud interpolates toward the near corner', r > 180 and g < 80 and b < 80, r .. ',' .. g .. ',' .. b)
+end
+
+do
+	-- Depth: the same screen triangle at w = 2 is farther, so it must lose.
+	local chip = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000 })
+	local ram = scene(chip)
+	buffer.writeu32(ram, 0x6300, 0xFF0000FF)
+	putFloats(ram, 0x6400, {
+		1.0, 0.0, 0.0, 0.0,
+		0.0, 1.0, 0.0, 0.0,
+		0.0, 0.0, 1.0, 0.0,
+		0.0, 0.0, 0.0, 2.0,
+	})
+
+	local raster = chip.gpu.raster
+	raster.colourBase = 0x4000
+	raster.depthBase = 0x5000
+	raster:setScissor(0, 0, 16, 16)
+	raster:clear(0xFF000000)
+	raster:drawMesh(0x6200, 0x6000, 0, 0, false, 0.0001)
+	-- now give the mesh a colour, so a wrongly drawn far triangle would show up
+	buffer.writeu32(ram, 0x6208, 0x6300)
+	raster:drawMesh(0x6200, 0x6400, 1, 0, false, 0.0001)
+
+	eq('nearer fragment wins the depth test', buffer.readu32(ram, 0x4000 + (5 * 16 + 2) * 4), 0xFFFFFFFF)
+	check('depth still holds the near value', math.abs(buffer.readf32(ram, 0x5000 + (5 * 16 + 2) * 4) - 1.0) < 1e-6)
+end
+
+do
+	-- Culling: reversing the winding makes it a back face.
+	local chip = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000 })
+	local ram = scene(chip)
+	local raster = chip.gpu.raster
+	raster.colourBase = 0x4000
+	raster.depthBase = 0x5000
+	raster:setScissor(0, 0, 16, 16)
+	raster:clear(0xFF000000)
+
+	local front = raster:drawMesh(0x6200, 0x6000, 0, 0, true, 0.0001)
+	eq('front face survives culling', front, 1)
+
+	raster:clear(0xFF000000)
+	raster.stats.culled = 0
+	-- Reverse the winding with an index buffer: now it is a back face.
+	buffer.writeu32(ram, 0x6340, 2)
+	buffer.writeu32(ram, 0x6344, 1)
+	buffer.writeu32(ram, 0x6348, 0)
+	buffer.writeu32(ram, 0x6210, 0x6340)
+	local back = raster:drawMesh(0x6200, 0x6000, 0, 0, true, 0.0001)
+	eq('back face is culled', back, 0)
+	eq('cull counter moved', raster.stats.culled, 1)
+	eq('nothing was drawn for the back face', buffer.readu32(ram, 0x4000 + (5 * 16 + 2) * 4), 0xFF000000)
+end
+
+do
+	-- Pin the matrix convention. Row-major, column-vector: translation belongs
+	-- in the fourth column, which is elements 3, 7 and 11. Getting this wrong
+	-- silently produces w = -1 for every vertex, so it is worth a test.
+	local chip = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000 })
+	local ram = scene(chip)
+	-- shift x by +1 in clip space: element 3 is the x translation
+	local translation = {
+		1.0, 0.0, 0.0, 1.0,
+		0.0, 1.0, 0.0, 0.0,
+		0.0, 0.0, 1.0, 0.0,
+		0.0, 0.0, 0.0, 1.0,
+	}
+	putFloats(ram, 0x6500, translation)
+
+	local raster = chip.gpu.raster
+	raster.colourBase = 0x4000
+	raster.depthBase = 0x5000
+	raster:setScissor(0, 0, 16, 16)
+	raster:clear(0xFF000000)
+	raster:drawMesh(0x6200, 0x6500, 0, 0, false, 0.0001)
+
+	-- The triangle originally covered x < y. One clip unit is half the screen, so
+	-- it now covers 8 <= x <= y + 8: pixel (10, 14) is inside, and (2, 5) - which
+	-- was inside before the shift - is now outside.
+	eq('translation moves the triangle', buffer.readu32(ram, 0x4000 + (14 * 16 + 10) * 4), 0xFFFFFFFF)
+	eq('the old region is now empty', buffer.readu32(ram, 0x4000 + (5 * 16 + 2) * 4), 0xFF000000)
+	eq('depth stays 1/w for a w = 1 matrix', buffer.readf32(ram, 0x5000 + (14 * 16 + 10) * 4), 1.0)
+end
+
+--=====================================================================
+-- Graphics unit, driven by guest machine code
+--=====================================================================
+
+do
+	local chip = Zindex.new({ ramSize = 0x10000, width = 16, height = 16, back = 0x4000, depth = 0x5000 })
+	chip:assemble[[
+			li r1, 0x0F006000
+			li r2, queue
+			sw r2, 0(r1)
+			li r2, 3
+			sw r2, 4(r1)
+			li r2, 1
+			sw r2, 8(r1)
+			halt
+
+			.org 0x6000
+		matrix:
+			.f32 1.0, 0.0, 0.0, 0.0
+			.f32 0.0, 1.0, 0.0, 0.0
+			.f32 0.0, 0.0, 1.0, 0.0
+			.f32 0.0, 0.0, 0.0, 1.0
+		positions:
+			.f32 -1.0, -1.0, 0.0
+			.f32 1.0, -1.0, 0.0
+			.f32 -1.0, 1.0, 0.0
+		mesh:
+			.word 3, positions, 0, 0, 0, 3
+		queue:
+			.word 1, 0xFF000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+			.word 3, mesh, 0, 0, matrix, 0, 0, 1, 0, 0, 0, 0
+			.word 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+	]]
+	chip:run(1000)
+
+	eq('guest ran the gpu queue', chip.gpu.commandsRun, 3)
+	eq('guest draw reached the rasteriser', chip.gpu.raster.stats.triangles, 1)
+	eq('guest-drawn pixel', buffer.readu32(chip:ram(), 0x4000 + (5 * 16 + 2) * 4), 0xFFFFFFFF)
+	check('guest asked for a present', chip.devices.framebuffer.presentRequested == true)
+	eq('gpu status is done', chip.gpu.status, 2)
+end
+
 --=====================================================================
 -- Summary
 --=====================================================================

@@ -38,16 +38,59 @@ fragment (`1/w > 0`) passes the first depth test.
 The GPU is fed, not called. Commands are written into RAM and kicked through the MMIO window
 (doc 05 section 3):
 
-| Command | Args | Effect |
-| --- | --- | --- |
-| `SET_CAMERA` | view-proj matrix address, near | set clip state |
-| `CLEAR` | r, g, b, a | fill colour, clear depth to 0 |
-| `SET_TILE` | x, y, w, h | restrict raster to a tile rectangle |
-| `DRAW_MESH` | mesh address, triangle count, matrix address, shading mode, texture address | enqueue a mesh draw |
-| `COMPOSITE` | source tile address, framebuffer address, rect | bulk copy a finished tile |
-| `PRESENT` | - | request this frame's single upload |
+**Implemented** in `src/Zindex/Gpu.luau`, which registers itself on the GPU page
+`0x0F006000` and is drained by the host once per CPU budget.
 
-`DRAW_MESH` is the only command the CPU issues per object; everything else is per frame.
+Registers:
+
+| Offset | Register |
+| --- | --- |
+| +0x00 | queue base address |
+| +0x04 | queue length in commands |
+| +0x08 | kick, write 1 to run the queue; reads 1 while work is pending |
+| +0x0C | status: 0 idle, 1 pending, 2 done |
+| +0x10 | commands run (stat) |
+| +0x14 | triangles submitted (stat) |
+| +0x18 | fragments written (stat) |
+| +0x1C | near plane, as float bits |
+| +0x20 | colour buffer address |
+| +0x24 | depth buffer address |
+| +0x28 | scissor x |
+| +0x2C | scissor y |
+| +0x30 | scissor width |
+| +0x34 | scissor height |
+
+Commands, 48 bytes each (see doc 05 for the field list):
+
+| Op | Meaning |
+| --- | --- |
+| `NOP` (0) | nothing |
+| `CLEAR` (1) | `src` is a packed colour; fill the rect, clear depth to 0 |
+| `SET_DEPTH` (2) | `src` becomes the depth plane address |
+| `DRAW_MESH` (3) | `src` mesh, `matrix` matrix, `texture` texture, `shading` mode, `flags` culling |
+| `PRESENT` (4) | request this frame's single upload |
+| `SET_COLOUR` (5) | `src` becomes the colour plane address |
+
+The colour and depth planes live in RAM, so the rasteriser writes straight into
+the guest's framebuffer with no intermediate copy.
+
+Mesh descriptor:
+
+| Offset | Field |
+| --- | --- |
+| +0x00 | vertexCount |
+| +0x04 | positions address, float3 per vertex |
+| +0x08 | colours address, RGBA8 per vertex, or 0 |
+| +0x0C | uvs address, float2 per vertex, or 0 |
+| +0x10 | indices address, u32 per index, or 0 for a plain triangle list |
+| +0x14 | indexCount |
+
+Texture descriptor: +0x00 width, +0x04 height, +0x08 pixels address (RGBA8, row
+major).
+
+The matrix is 16 floats, row major, column-vector convention: the translation is
+in elements 3, 7 and 11, and the projection row is 12..15. Getting that backwards
+is silent - every vertex ends up with `w = -1` - so the suite pins it with a test.
 
 ## 4. Tiling and parallel rasterisation
 

@@ -13,7 +13,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODULES = ['Opcodes', 'Memory', 'Devices', 'Core', 'Assembler', 'Image', 'init']
+MODULES = ['Opcodes', 'Memory', 'Raster', 'Gpu', 'Devices', 'Core', 'Assembler', 'Image', 'init']
 
 
 def read(path):

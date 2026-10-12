@@ -10,6 +10,8 @@ not do yet. Written so that nobody has to guess.
 | `Opcodes.luau` | the instruction set as data: opcode, name, encoding form, size |
 | `Memory.luau` | the address space: RAM buffer, device window, trap page, per-access cycle cost |
 | `Devices.luau` | the standard device set: DEV, TIMER, INPUT, AUDIO, IPC, FB |
+| `Raster.luau` | the raster unit: transform, near clip, project, cull, edge-function raster |
+| `Gpu.luau` | the graphics unit: command queue, registers, queue pump |
 | `Core.luau` | a CPU core: registers, decode, execute, cycle accounting, disassembler |
 | `Assembler.luau` | two-pass assembler: labels, expressions, directives, listing |
 | `Image.luau` | program image pack and unpack |
@@ -27,7 +29,8 @@ python3 Tests/bundle.py && luau Tests/combined.luau
 
 `Tests/bundle.py` rewrites `require(script.Parent.X)` into a module table so the
 library runs unchanged outside Roblox, then appends `Tests/suite.luau`. The
-suite drives the real core through the real assembler; nothing is mocked.
+suite drives the real core through the real assembler; nothing is mocked. 83
+checks, all passing.
 
 Covered: arithmetic wrapping and 32-bit multiply exactness, shifts including the
 32-or-more rule, signed and unsigned comparison, byte/half/word load and store
@@ -36,34 +39,55 @@ end to end, device reads and writes through MMIO, host calls, assembler
 directives and label expressions, image round trip, illegal opcode handling,
 and save state replay being byte-exact.
 
-The save state test is the important one: it runs a program, snapshots, runs on,
-restores, and re-runs, then requires the RAM and the cycle count to match
-exactly. That is the determinism claim from doc 03 actually being checked.
+On the graphics side: the raster unit is driven directly for coverage, depth,
+interpolation, culling and the matrix convention, and then driven end to end by
+assembled guest code that writes its own command queue and kicks the GPU.
+
+Two tests matter more than the rest. The save state test runs a program,
+snapshots, runs on, restores and re-runs, then requires the RAM and the cycle
+count to match exactly - that is the determinism claim from doc 03 being checked
+rather than asserted. The matrix convention test exists because getting the
+convention backwards is silent: every vertex ends up with `w = -1`, every
+triangle is culled, and the screen is simply empty with no error anywhere.
+
+`Examples/demo.luau` fills a framebuffer from machine code and asks the host to
+present. `Examples/gpu.luau` uploads a mesh and a matrix, then has guest code
+draw a 3D cube through the command queue.
 
 ## 3. What is not implemented yet
 
 Stated plainly, in the order it would matter:
 
-1. **Tier 1 and Tier 2 execution** (doc 03 sections 1). The core is the dispatch
+1. **Tier 1 and Tier 2 execution** (doc 03 section 1). The core is the dispatch
    loop only. `--!native` is declared on `Core.luau` and is honoured on the
    server, but the block compiler does not exist.
 2. **Multi-core.** The IPC device exposes a shared-region descriptor, and `SYNC`
    executes, but no Actor fan-out and no `SharedTable` region exist. One core is
    the only configuration today.
-3. **Interrupts.** `Core.onInterrupt` and `Core.irqEnabled` exist and are polled
+3. **Tile-parallel rasterisation.** The raster unit is single-Actor and renders at
+   a fixed resolution. Splitting the screen across Actors depends on whether a
+   `buffer` can cross an Actor boundary, which is still unvalidated (doc 06
+   section 4).
+4. **Adaptive resolution.** Avalon's scale adjustment is not ported; resolution
+   is fixed at construction.
+5. **Interrupts.** `Core.onInterrupt` and `Core.irqEnabled` exist and are polled
    every 256 instructions, but no device raises an interrupt yet.
-4. **Audio.** The AUDIO page is addressable and inert.
-5. **The Avalon raster unit** (doc 06) is specified but not wired in. There is no
-   GPU command queue in `Devices` yet, so a guest cannot issue `DRAW_MESH`.
-6. **Assembler conveniences**: no macros, no `.equ`, no floating point exponents
+6. **Audio.** The AUDIO page is addressable and inert.
+7. **Assembler conveniences**: no macros, no `.equ`, no floating point exponents
    in expressions (a `-` inside `1e-3` would parse as a subtraction).
 
-## 4. Two bugs the tests caught, as evidence they are worth running
+## 4. Bugs the tests caught, as evidence they are worth running
 
 - `not` is form F2, which has three operand slots, but it only needs two. The
   assembler demanded all three until the suite failed on `not r9, r0`.
 - `Memory` had both a field `ram` and a method `ram`. Because the field exists on
   the instance, `self.memory:ram()` resolved to the buffer and tried to call it.
   The accessor is now `getRam()`.
+- `buffer.fill` sets a **byte** value, not a word. Clearing the colour plane with
+  a packed RGBA word silently wrote only its low byte, so every clear produced
+  zeros. `Raster:clear` now writes one 32-bit word per pixel.
+- The transform was doing row-vector maths while the spec says row-major,
+  column-vector. It was invisible until a 3D cube rendered as an empty screen,
+  because `w` came out as `-1` for every vertex and everything was culled.
 
-Both were found by running the suite, not by reading the code.
+All four were found by running the suite and the examples, not by reading code.

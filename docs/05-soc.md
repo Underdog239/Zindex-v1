@@ -35,14 +35,22 @@ and only tiles and results ever cross a boundary.
 
 The GPU and NPU are not called. They are fed.
 
-| Field | Meaning |
-| --- | --- |
-| op | draw mesh, set matrix, clear, set tile, composite, present, tensor op |
-| src | source buffer address |
-| dst | destination buffer address (tile or framebuffer) |
-| count | triangle or element count |
-| rect | tile rectangle, x y w h |
-| arg | op-specific parameter |
+A command is 48 bytes, 12 words:
+
+| Word | Field | Meaning |
+| --- | --- | --- |
+| +0x00 | op | NOP, CLEAR, SET_DEPTH, DRAW_MESH, PRESENT, SET_COLOUR |
+| +0x04 | src | source buffer address |
+| +0x08 | dst | destination buffer address, or 0 for the default |
+| +0x0C | count | triangle or element count |
+| +0x10 | matrix | matrix address |
+| +0x14 | texture | texture descriptor address, or 0 |
+| +0x18 | shading | 0 flat, 1 gouraud, 2 textured |
+| +0x1C | flags | bit 0 = back-face culling |
+| +0x20 | rectX | scissor rectangle, 0 0 0 0 means the whole target |
+| +0x24 | rectY | |
+| +0x28 | rectW | |
+| +0x2C | rectH | |
 
 The CPU writes commands into RAM and kicks the queue by writing the GPU kick register in the MMIO
 window. The host bridge drains the queue each frame and dispatches work to Actors.
